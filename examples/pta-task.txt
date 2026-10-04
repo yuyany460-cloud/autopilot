@@ -1,0 +1,6 @@
+完成这个页面里的所有题目（可能是单选题，也可能是编程题，先看清楚题目类型）：
+
+https://pintia.cn/problem-sets/2102237619822460928/exam/problems/type/2
+
+登录态已经保存在 var\browser-profile 里了。
+全部做完之后先问我要不要提交，不要自动提交。

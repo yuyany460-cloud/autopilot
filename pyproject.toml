@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autopilot"
+version = "1.0.0"
+description = "AutoPilot —— Windows 全自动电脑操控框架（UIA + OCR 感知，LLM 自主决策）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "autopilot" }]
+keywords = ["automation", "windows", "ui-automation", "ocr", "agent", "llm", "rpa"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Software Development :: User Interfaces",
+]
+
+# 核心零第三方依赖：只用标准库 + ctypes + Windows 自带的 PowerShell 5.1
+dependencies = []
+
+[project.optional-dependencies]
+image = ["pillow>=10.0", "mss>=9.0"]
+web = ["fastapi>=0.110", "uvicorn>=0.29"]
+browser = ["playwright>=1.40"]
+all = ["pillow>=10.0", "mss>=9.0", "fastapi>=0.110", "uvicorn>=0.29", "playwright>=1.40"]
+
+[project.scripts]
+apilot = "autopilot.cli:main"
+
+[project.urls]
+Homepage = "https://example.invalid/autopilot"
+
+[tool.setuptools.packages.find]
+include = ["autopilot*"]
+
+[tool.setuptools.package-data]
+autopilot = ["ps/*.ps1", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "hardware: 需要真实桌面/会短暂移动鼠标的测试，可用 -m 'not hardware' 跳过",
+]

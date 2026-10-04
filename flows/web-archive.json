@@ -1,0 +1,26 @@
+{
+  "name": "网页内容抓取与存档",
+  "description": "用受控浏览器打开网页、取正文、存成 Markdown 文件。演示 browser_* 系列动作。",
+  "vars": {
+    "网址": "https://example.com",
+    "输出": "var/reports/page-${date}.md"
+  },
+  "steps": [
+    {
+      "action": "browser_open",
+      "params": { "url": "${网址}", "headless": true, "channel": "msedge" },
+      "comment": "复用系统 Edge，不需要下载 Chromium"
+    },
+    {
+      "action": "browser_screenshot",
+      "params": { "path": "var/shots/page-${date}.png", "full_page": true }
+    },
+    {
+      "action": "browser_get_text",
+      "params": { "max_chars": 8000 }
+    },
+    {
+      "action": "browser_close"
+    }
+  ]
+}

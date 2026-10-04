@@ -1,0 +1,44 @@
+{
+  "name": "早安流程",
+  "description": "开机后一键把常用程序拉起来、调音量、发通知、留一张截图。可按需增删。",
+  "vars": {
+    "要打开的程序": "notepad.exe",
+    "音量档位": "8"
+  },
+  "steps": [
+    {
+      "action": "notify",
+      "params": { "title": "AutoPilot", "message": "早安流程开始，正在准备工作环境…" }
+    },
+    {
+      "action": "run_command",
+      "params": {
+        "command": "echo 当前时间 %date% %time%",
+        "shell": "cmd",
+        "timeout": 15
+      },
+      "comment": "记录一下开始时间"
+    },
+    {
+      "action": "system_info",
+      "comment": "看看内存和磁盘还够不够用"
+    },
+    {
+      "action": "launch_app",
+      "params": { "target": "${要打开的程序}", "wait": 2.0 }
+    },
+    {
+      "action": "volume",
+      "params": { "action": "up", "steps": 3 }
+    },
+    {
+      "action": "screenshot",
+      "params": { "path": "var/shots/morning-${date}.png" },
+      "comment": "每天的桌面留一张存档"
+    },
+    {
+      "action": "notify",
+      "params": { "title": "AutoPilot", "message": "环境已就绪，开始干活吧" }
+    }
+  ]
+}

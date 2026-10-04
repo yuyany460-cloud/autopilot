@@ -1,0 +1,60 @@
+{
+  "name": "记事本端到端演示",
+  "description": "全程不依赖 LLM：新建临时文件 → 记事本打开 → Ctrl+A 全选覆盖输入 → Ctrl+S 保存 → 从磁盘读回验证。只碰 var/scratch 下的临时文件，文件名带时间戳所以每次运行互不干扰。故意不关闭窗口：Win11 记事本会恢复上次会话，强行关窗会牵连用户自己未保存的标签页。",
+  "vars": {
+    "文件": "var/scratch/demo-${timestamp}.txt",
+    "内容": "AutoPilot 端到端演示\n生成时间：${datetime}\n中文输入与保存验证 ✔"
+  },
+  "steps": [
+    {
+      "action": "write_file",
+      "params": { "path": "${文件}", "content": "这一行应该被 Ctrl+A 覆盖掉\n", "mode": "overwrite" },
+      "comment": "先落一个只有本项目会碰的临时文件"
+    },
+    {
+      "action": "launch_app",
+      "params": { "target": "notepad.exe", "args": "${workspace}\\${文件}", "wait": 2.5 },
+      "comment": "launch_app 会自动等窗口出现并切到前台"
+    },
+    {
+      "action": "wait",
+      "params": { "seconds": 0.8 }
+    },
+    {
+      "action": "hotkey",
+      "params": { "keys": "ctrl+a" },
+      "comment": "全选原有内容，下一步输入会把它替换掉"
+    },
+    {
+      "action": "type_text",
+      "params": { "text": "${内容}", "method": "unicode" },
+      "comment": "结果里会回报文字究竟落到了哪个窗口——焦点被抢时会立刻暴露"
+    },
+    {
+      "action": "wait",
+      "params": { "seconds": 0.5 }
+    },
+    {
+      "action": "get_focused_value",
+      "comment": "读控件的真实值（不是 OCR）：内容应该只剩新输入的文字，说明 Ctrl+A 生效"
+    },
+    {
+      "action": "hotkey",
+      "params": { "keys": "ctrl+s" },
+      "comment": "保存"
+    },
+    {
+      "action": "wait",
+      "params": { "seconds": 0.8 }
+    },
+    {
+      "action": "read_file",
+      "params": { "path": "${文件}", "max_chars": 800 },
+      "comment": "从磁盘读回，和上面 UIA 读到的内容对照，端到端闭环"
+    },
+    {
+      "action": "note",
+      "params": { "message": "演示结束：建文件 → 打开 → 覆盖输入 → 保存 → 磁盘校验，全部通过" }
+    }
+  ]
+}

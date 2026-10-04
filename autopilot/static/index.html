@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoPilot 控制台</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c232c; --line:#2a323d;
+    --fg:#d7dee8; --dim:#8b98a8; --accent:#4c9aff; --ok:#3fb950;
+    --warn:#d29922; --err:#f85149; --mag:#bc8cff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:13px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;
+         background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  .badge{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--panel2);
+         border:1px solid var(--line);color:var(--dim)}
+  .badge.ok{color:var(--ok);border-color:#1f4a2a}
+  .badge.err{color:var(--err);border-color:#5a2320}
+  .spacer{flex:1}
+  button{font:inherit;cursor:pointer;border-radius:6px;border:1px solid var(--line);
+         background:var(--panel2);color:var(--fg);padding:6px 12px;transition:.15s}
+  button:hover:not(:disabled){border-color:var(--accent);color:#fff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.primary:hover:not(:disabled){background:#388bfd}
+  button.danger{background:#7d1f1a;border-color:#b3382c;color:#ffd9d5}
+  button.danger:hover:not(:disabled){background:#a3261d}
+  button.small{padding:3px 8px;font-size:12px}
+  main{display:grid;grid-template-columns:minmax(420px,1.15fr) minmax(380px,1fr);
+       gap:12px;padding:12px;align-items:start}
+  @media(max-width:1100px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        overflow:hidden;margin-bottom:12px}
+  .card>h2{margin:0;padding:9px 13px;font-size:12.5px;font-weight:600;
+           background:var(--panel2);border-bottom:1px solid var(--line);
+           display:flex;align-items:center;gap:8px;color:#c3ccd8}
+  .card>.body{padding:12px}
+  #shot{width:100%;display:block;background:#000;border-bottom:1px solid var(--line);
+        max-height:52vh;object-fit:contain}
+  input[type=text],input[type=number],textarea,select{
+    width:100%;background:#0b0f14;border:1px solid var(--line);color:var(--fg);
+    border-radius:6px;padding:6px 9px;font:inherit;font-family:inherit}
+  textarea{resize:vertical;min-height:60px}
+  label{display:block;font-size:11.5px;color:var(--dim);margin:7px 0 3px}
+  .row{display:flex;gap:8px;align-items:center}
+  .row>*{flex:1}
+  .row>button{flex:0 0 auto}
+  pre,.mono{font-family:"Cascadia Mono",Consolas,"Courier New",monospace;font-size:11.5px}
+  #log{height:340px;overflow:auto;padding:8px 10px;background:#0b0f14;
+       border-top:1px solid var(--line)}
+  #log div{padding:2px 0;border-bottom:1px solid #141a21;white-space:pre-wrap;word-break:break-word}
+  .k-log{color:var(--dim)}
+  .k-llm{color:var(--accent)}
+  .k-action{color:var(--mag)}
+  .k-result .ok{color:var(--ok)}
+  .k-result .bad{color:var(--err)}
+  .k-error{color:var(--err)}
+  .k-finished{color:var(--ok);font-weight:600}
+  .k-stopped{color:var(--warn)}
+  #text-out{max-height:300px;overflow:auto;white-space:pre-wrap;background:#0b0f14;
+            border:1px solid var(--line);border-radius:6px;padding:9px;margin-top:9px}
+  .pill{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:8px;
+        border:1px solid var(--line);color:var(--dim);margin-left:6px}
+  .pill.safe{color:var(--ok)}.pill.low{color:#7ea6d8}
+  .pill.medium{color:var(--warn)}.pill.high{color:var(--err)}
+  .actions-grid{max-height:300px;overflow:auto;display:flex;flex-wrap:wrap;gap:5px;
+                padding:9px;border-top:1px solid var(--line)}
+  .actions-grid button{font-size:11.5px;padding:3px 8px}
+  .actions-grid button.active{border-color:var(--accent);color:#fff;background:#1b2735}
+  .flow-item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #1b222b}
+  .flow-item:last-child{border-bottom:none}
+  .flow-item .t{flex:1;min-width:0}
+  .flow-item .t b{font-weight:600}
+  .flow-item .t div{color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .hint{color:var(--dim);font-size:11.5px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:12px}
+  .kv span:nth-child(odd){color:var(--dim)}
+  .danger-zone{border-color:#5a2320}
+</style>
+</head>
+<body>
+<header>
+  <h1>⬢ AutoPilot</h1>
+  <span class="badge" id="b-ver">…</span>
+  <span class="badge" id="b-model">…</span>
+  <span class="badge" id="b-guard">…</span>
+  <span class="badge" id="b-hotkey">…</span>
+  <span class="spacer"></span>
+  <span class="badge" id="b-fore"></span>
+  <button class="danger" id="btn-stop">⏹ 急停 (Ctrl+Alt+Q)</button>
+  <button id="btn-resume" class="small">解除急停</button>
+</header>
+
+<main>
+  <!-- 左列 -->
+  <section>
+    <div class="card">
+      <h2>实时画面 <span class="spacer"></span>
+        <label class="hint" style="margin:0"><input type="checkbox" id="live" checked
+          style="width:auto;vertical-align:middle"> 自动刷新</label>
+        <button class="small" id="btn-shot">立即刷新</button>
+      </h2>
+      <img id="shot" alt="屏幕截图">
+    </div>
+
+    <div class="card">
+      <h2>下达任务（Agent 自主完成）</h2>
+      <div class="body">
+        <textarea id="goal" placeholder="例如：打开记事本，写下今天的日期和时间，保存到桌面上的 note.txt，然后关闭记事本。"></textarea>
+        <div class="row" style="margin-top:9px">
+          <div style="flex:0 0 130px">
+            <label>最多步数</label>
+            <input type="number" id="max-steps" value="25" min="1" max="200">
+          </div>
+          <div style="flex:0 0 auto;padding-top:16px">
+            <label style="margin:0"><input type="checkbox" id="fast" checked
+              style="width:auto;vertical-align:middle"> 快速模式(不做OCR)</label>
+          </div>
+          <div style="flex:0 0 auto;padding-top:16px">
+            <label style="margin:0"><input type="checkbox" id="danger"
+              style="width:auto;vertical-align:middle"> 允许危险操作</label>
+          </div>
+          <div style="flex:0 0 auto;padding-top:14px">
+            <button class="primary" id="btn-run">▶ 开始执行</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>执行日志</h2>
+      <div id="log"></div>
+    </div>
+
+    <div class="card">
+      <h2>页面观察（UIA + OCR 文本）</h2>
+      <div class="body">
+        <div class="row">
+          <button id="btn-observe">读取当前屏幕</button>
+          <label style="margin:0;flex:0 0 auto"><input type="checkbox" id="obs-ocr" checked
+            style="width:auto;vertical-align:middle"> 含 OCR</label>
+        </div>
+        <div id="text-out" class="mono">点上面的按钮读取一次。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右列 -->
+  <section>
+    <div class="card">
+      <h2>动作面板 <span class="pill" id="act-count"></span></h2>
+      <div class="actions-grid" id="act-list"></div>
+      <div class="body" id="act-form-wrap" style="display:none;border-top:1px solid var(--line)">
+        <div style="margin-bottom:6px"><b id="act-name"></b>
+          <span class="hint" id="act-cat"></span></div>
+        <div id="act-form"></div>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="btn-act-run">执行</button>
+          <button id="btn-act-clear">清空</button>
+        </div>
+        <div id="act-result" class="mono" style="margin-top:9px;color:var(--dim)"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>确定性流程 <span class="hint">不消耗 token，可反复执行</span></h2>
+      <div class="body" id="flow-list"><span class="hint">加载中…</span></div>
+    </div>
+
+    <div class="card">
+      <h2>运行状态</h2>
+      <div class="body"><div class="kv" id="state-kv"></div></div>
+    </div>
+
+    <div class="card">
+      <h2>审计记录 <button class="small" id="btn-audit" style="margin-left:auto">刷新</button></h2>
+      <div class="body"><div id="audit-out" class="mono hint">点刷新查看最近的操作记录。</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const api = (p, o) => fetch(p, o).then(r => r.json());
+
+/* ---------------- 状态栏 ---------------- */
+async function refreshState(){
+  try{
+    const s = await api('/api/state');
+    $('b-ver').textContent = 'v' + s.version;
+    $('b-model').textContent = s.llm.has_key ? s.llm.model : '未配置密钥';
+    $('b-model').className = 'badge ' + (s.llm.has_key ? 'ok' : 'err');
+    $('b-guard').textContent = s.guard;
+    $('b-hotkey').textContent = '急停 ' + s.killswitch.hotkey +
+      (s.killswitch.registered ? ' 已注册' : ' 未注册');
+    $('b-hotkey').className = 'badge ' + (s.killswitch.registered ? 'ok' : 'err');
+    const f = s.foreground;
+    $('b-fore').textContent = f ? (f.title || f.process).slice(0,42) : '无前台窗口';
+    $('b-fore').className = 'badge ' + (s.agent_running ? 'ok' : '');
+    $('btn-run').disabled = s.agent_running;
+    $('btn-run').textContent = s.agent_running ? '执行中…' : '▶ 开始执行';
+    $('state-kv').innerHTML = [
+      ['运行时长', s.uptime_s + ' s'],
+      ['前台窗口', f ? (f.title||'') + ' / ' + f.process : '—'],
+      ['窗口尺寸', f ? f.rect.width + '×' + f.rect.height : '—'],
+      ['已执行动作', s.steps],
+      ['已注册动作', s.actions],
+      ['安全策略', s.guard],
+      ['模型', s.llm.model + ' @ ' + s.llm.base_url],
+      ['急停状态', s.killswitch.triggered ? ('已触发：' + s.killswitch.reason) : '正常'],
+      ['上次任务', s.last_run ? (s.last_run.success ? '成功' : '未完成') + '（' +
+        s.last_run.steps + ' 步，' + s.last_run.duration_s + 's）' : '—'],
+    ].map(([k,v]) => `<span>${k}</span><span>${esc(v)}</span>`).join('');
+  }catch(e){ /* 忽略瞬时错误 */ }
+}
+const esc = s => String(s??'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+/* ---------------- 截图 ---------------- */
+let liveTimer = null;
+function refreshShot(){ $('shot').src = '/api/screen.jpg?ts=' + Date.now(); }
+function setLive(on){
+  if(liveTimer){ clearInterval(liveTimer); liveTimer = null; }
+  if(on) liveTimer = setInterval(refreshShot, 1500);
+}
+$('live').onchange = e => setLive(e.target.checked);
+$('btn-shot').onclick = refreshShot;
+
+/* ---------------- 日志 ---------------- */
+const logBox = $('log');
+function addLog(html, cls=''){
+  const d = document.createElement('div');
+  d.className = cls;
+  d.innerHTML = html;
+  logBox.appendChild(d);
+  logBox.scrollTop = logBox.scrollHeight;
+  while(logBox.childNodes.length > 600) logBox.removeChild(logBox.firstChild);
+}
+const ts = () => new Date().toLocaleTimeString('zh-CN', {hour12:false});
+
+/* ---------------- 事件流 ---------------- */
+function connectSSE(){
+  const es = new EventSource('/api/events');
+  es.onmessage = ev => { try{ handleEvent(JSON.parse(ev.data)); }catch(e){} };
+  es.onerror = () => { addLog('<span class="k-error">与服务器的连接中断，3 秒后重连…</span>'); };
+  setInterval(()=>{ if(es.readyState === 2){ es.close(); connectSSE(); } }, 3000);
+}
+function handleEvent(e){
+  const k = e.kind;
+  if(k === 'log'){ addLog(`<span class="k-log">[${ts()}] ${esc(e.message)}</span>`); }
+  else if(k === 'llm'){
+    if(e.content) addLog(`<span class="k-llm">💭 ${esc(e.content).slice(0,600)}</span>`);
+    (e.tool_calls||[]).forEach(c => addLog(
+      `<span class="k-action">🎯 步骤 ${e.step} → <b>${esc(c.name)}</b> ${esc(JSON.stringify(c.arguments)).slice(0,400)}</span>`));
+  }
+  else if(k === 'result'){
+    const r = e.result || {};
+    if(r.denied) addLog(`<span class="bad">⛔ 被拒绝：${esc(r.reason)}</span>`, 'k-result');
+    else if(r.ok) addLog(`<span class="ok">✅ ${esc((r.output||'').slice(0,500))}</span>`, 'k-result');
+    else addLog(`<span class="bad">❌ ${esc(r.error)}</span>`, 'k-result');
+  }
+  else if(k === 'observation'){ refreshShot(); }
+  else if(k === 'finished'){ addLog(`<span class="k-finished">🏁 ${esc(e.summary)}</span>`); refreshState(); }
+  else if(k === 'stopped'){ addLog(`<span class="k-stopped">⏹ ${esc(e.reason)}</span>`); }
+  else if(k === 'error'){ addLog(`<span class="k-error">⚠ ${esc(e.message)}</span>`); }
+  else if(k === 'narration'){ addLog(`<span class="k-log">（模型未给出动作）${esc(e.text).slice(0,300)}</span>`); }
+  else if(k === 'flow_start'){ addLog(`<span class="k-llm">▶ 流程开始：${esc(e.name)}</span>`); }
+  else if(k === 'flow_step'){
+    const r = e.result||{};
+    addLog(`${r.ok?'✅':'❌'} ${e.index}. ${esc(r.action)} — ${esc((r.output||r.error||'').slice(0,300))}`);
+  }
+  else if(k === 'flow_done'){ addLog(`<span class="k-finished">流程结束：成功 ${e.ok}/${e.total} 步</span>`); }
+  else if(k === 'agent_stopped'){ refreshState(); }
+}
+
+/* ---------------- 任务 ---------------- */
+$('btn-run').onclick = async () => {
+  const goal = $('goal').value.trim();
+  if(!goal){ alert('请先填写任务目标'); return; }
+  const res = await api('/api/agent/start', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({goal, max_steps:+$('max-steps').value,
+                          allow_danger:$('danger').checked, fast:$('fast').checked})
+  }).catch(e => ({detail:String(e)}));
+  if(res.detail) addLog(`<span class="k-error">启动失败：${esc(res.detail)}</span>`);
+  else addLog(`<span class="k-llm">任务已下发：${esc(goal)}</span>`);
+  refreshState();
+};
+$('btn-stop').onclick = async () => {
+  await api('/api/agent/stop', {method:'POST'});
+  addLog('<span class="k-stopped">⏹ 已发送急停指令</span>');
+};
+$('btn-resume').onclick = async () => {
+  await api('/api/agent/resume', {method:'POST'});
+  addLog('<span class="k-log">急停状态已解除</span>');
+  refreshState();
+};
+$('goal').addEventListener('keydown', e => {
+  if(e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('btn-run').click();
+});
+
+/* ---------------- 观察 ---------------- */
+$('btn-observe').onclick = async () => {
+  $('text-out').textContent = '读取中…';
+  const r = await api('/api/observe?ocr=' + ($('obs-ocr').checked ? 'true':'false'));
+  $('text-out').textContent = r.text || r.detail || '（无内容）';
+};
+
+/* ---------------- 动作面板 ---------------- */
+let ACTIONS = [], current = null;
+async function loadActions(){
+  ACTIONS = await api('/api/actions');
+  $('act-count').textContent = ACTIONS.length + ' 个';
+  const box = $('act-list');
+  box.innerHTML = '';
+  const cats = {};
+  ACTIONS.forEach(a => (cats[a.category] = cats[a.category] || []).push(a));
+  Object.keys(cats).forEach(cat => {
+    const t = document.createElement('div');
+    t.style.cssText = 'flex:0 0 100%;color:var(--dim);font-size:11px;margin-top:6px';
+    t.textContent = '■ ' + cat;
+    box.appendChild(t);
+    cats[cat].forEach(a => {
+      const b = document.createElement('button');
+      b.textContent = a.name;
+      b.title = a.description;
+      b.onclick = () => selectAction(a, b);
+      box.appendChild(b);
+    });
+  });
+}
+function selectAction(a, btn){
+  current = a;
+  document.querySelectorAll('.actions-grid button').forEach(b => b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  $('act-form-wrap').style.display = 'block';
+  $('act-name').textContent = a.name;
+  $('act-cat').innerHTML = `<span class="pill ${a.danger}">${a.danger_label}</span>`;
+  const f = $('act-form');
+  f.innerHTML = '';
+  if(!a.params.length){ f.innerHTML = '<span class="hint">该动作没有参数。</span>'; }
+  a.params.forEach(p => {
+    const lab = document.createElement('label');
+    lab.textContent = `${p.name} · ${p.type}${p.required?' · 必填':''}${p.description?' — '+p.description:''}`;
+    f.appendChild(lab);
+    let el;
+    if(p.enum){
+      el = document.createElement('select');
+      p.enum.forEach(v => { const o=document.createElement('option'); o.value=v; o.textContent=v; el.appendChild(o); });
+    }else if(p.type === 'boolean'){
+      el = document.createElement('select');
+      [['true','是'],['false','否']].forEach(([v,t])=>{const o=document.createElement('option');o.value=v;o.textContent=t;el.appendChild(o);});
+    }else{
+      el = document.createElement('input');
+      el.type = (p.type==='integer'||p.type==='number') ? 'number' : 'text';
+    }
+    el.id = 'p-' + p.name;
+    if(p.default !== null && p.default !== undefined) el.value = p.default;
+    f.appendChild(el);
+  });
+  $('act-result').textContent = '';
+}
+$('btn-act-clear').onclick = () => { $('act-form').innerHTML=''; $('act-result').textContent='';
+  $('act-name').textContent=''; $('act-form-wrap').style.display='none';
+  document.querySelectorAll('.actions-grid button').forEach(b=>b.classList.remove('active')); };
+$('btn-act-run').onclick = async () => {
+  if(!current) return;
+  const params = {};
+  current.params.forEach(p => {
+    const el = $('p-' + p.name);
+    if(!el) return;
+    let v = el.value;
+    if(v === '' && !p.required) return;
+    if(p.type === 'boolean') v = (v === 'true');
+    else if(p.type === 'integer') v = parseInt(v,10);
+    else if(p.type === 'number') v = parseFloat(v);
+    params[p.name] = v;
+  });
+  $('act-result').textContent = '执行中…';
+  const r = await api('/api/action', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: current.name, params})});
+  $('act-result').textContent = r.ok
+    ? (r.output || '(无输出)')
+    : ('失败：' + (r.reason || r.error));
+  refreshShot();
+};
+
+/* ---------------- 流程 ---------------- */
+async function loadFlows(){
+  const list = await api('/api/flows');
+  const box = $('flow-list');
+  if(!list.length){ box.innerHTML = '<span class="hint">flows/ 目录下还没有流程文件。</span>'; return; }
+  box.innerHTML = '';
+  list.forEach(f => {
+    const d = document.createElement('div');
+    d.className = 'flow-item';
+    d.innerHTML = `<div class="t"><b>${esc(f.name)}</b><div>${esc(f.description||'')} · ${f.steps} 步</div></div>`;
+    const b = document.createElement('button');
+    b.className = 'small'; b.textContent = '▶ 运行';
+    b.onclick = async () => {
+      addLog(`<span class="k-llm">运行流程：${esc(f.name)}</span>`);
+      b.disabled = true;
+      try{
+        const resp = await fetch('/api/flow/run', {method:'POST',
+          headers:{'Content-Type':'application/json'}, body: JSON.stringify({file:f.file})});
+        const reader = resp.body.getReader(); const dec = new TextDecoder();
+        let buf = '';
+        while(true){
+          const {value, done} = await reader.read();
+          if(done) break;
+          buf += dec.decode(value, {stream:true});
+          const parts = buf.split('\n\n'); buf = parts.pop();
+          parts.forEach(p => {
+            const line = p.split('\n').find(l => l.startsWith('data: '));
+            if(line){ try{ handleEvent(JSON.parse(line.slice(6))); }catch(e){} }
+          });
+        }
+      }catch(e){ addLog(`<span class="k-error">流程请求失败：${esc(e)}</span>`); }
+      b.disabled = false; refreshShot();
+    };
+    d.appendChild(b);
+    box.appendChild(d);
+  });
+}
+
+/* ---------------- 审计 ---------------- */
+$('btn-audit').onclick = async () => {
+  const rows = await api('/api/audit?limit=80');
+  const out = $('audit-out');
+  if(!rows.length){ out.textContent = '（暂无记录）'; return; }
+  out.innerHTML = rows.reverse().map(r => {
+    const mark = r.denied ? '⛔' : (r.ok ? '✅' : '❌');
+    return `${mark} ${esc(r.ts||'').slice(11,19)} <b>${esc(r.action)}</b> ` +
+           `${esc(JSON.stringify(r.params||{})).slice(0,120)} ` +
+           `<span class="hint">${r.ms||0}ms</span>` +
+           (r.denied||r.error ? `<br><span style="color:var(--err)">${esc(r.reason||r.error)}</span>` : '');
+  }).join('<br>');
+};
+
+/* ---------------- 启动 ---------------- */
+refreshState(); setLive(true); refreshShot();
+loadActions(); loadFlows(); connectSSE();
+setInterval(refreshState, 3000);
+addLog('<span class="k-log">控制台已连接。急停热键 Ctrl+Alt+Q，或点右上角「急停」。</span>');
+</script>
+</body>
+</html>
