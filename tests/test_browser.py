@@ -162,6 +162,206 @@ def test_other_errors_are_not_swallowed(ctx) -> None:
     assert ctx.browser, "普通错误不该清空浏览器状态"
 
 
+def test_eval_without_return_value_does_not_fake_missing_browser(ctx,
+                                                                monkeypatch) -> None:
+    """回归：脚本没有返回值时，扩展也回 None，别把它当成"扩展不在线"。
+
+    实测（2026-10-16 的 PTA 运行）：agent 反复 ``const el = ...``，第二次同名
+    声明在同一个页面上下文里是 SyntaxError，扩展退化成 ``(() => { ... })()``
+    求值、返回 undefined，于是连续三步报"当前没有受控浏览器"——牛头不对马嘴，
+    还白扔三步。现在改成先看扩展在不在线，再看结果。
+    """
+    from autopilot import actions as A
+
+    class _FakeBridge:
+        port = 1
+        connected = True
+
+        def call(self, op, params=None, timeout=None):  # noqa: ANN001
+            return None                                  # 扩展答了 null
+
+    monkeypatch.setattr(A, "_ext", lambda ctx, wait=5.0: _FakeBridge())
+    out = build_registry(ctx).get("browser_eval").call(script="const a = 1;")
+    assert "没有返回值" in str(out), f"应给出可操作的提示，实际是：{out!r}"
+
+
+def test_browser_type_auto_finds_editor_and_reads_back(ctx, monkeypatch) -> None:
+    """target 留空时自动定位答题编辑器，写完读回**并且内容要真的对得上**。
+
+    实测（2026-10-16 的 PTA 运行）：80 步里有 25 步是 ``browser_eval``，
+    大半是模型自己在翻 ``.cm-content`` 找编辑器、写完再求值确认。
+    """
+    from autopilot import actions as A
+
+    calls = []
+    state = {"text": ""}
+
+    class _FakeBridge:
+        port = 1
+        connected = True
+
+        def call(self, op, params=None, timeout=None):  # noqa: ANN001
+            params = params or {}
+            calls.append((op, params))
+            script = params.get("script", "")
+            if op == "type":
+                state["text"] = str(params.get("text") or "")
+                return {"method": params.get("method"), "length": len(state["text"])}
+            if op == "eval":
+                if "usable.length" in script:
+                    return {"found": True, "tag": "DIV"}       # 找编辑器
+                if "walk(" in script:
+                    return state["text"]                       # 读回真实内容
+                if "monaco" in script:
+                    return ""                                  # 没有框架 API 可用
+                return {"found": True}
+            return {}
+
+    monkeypatch.setattr(A, "_ext", lambda ctx, wait=5.0: _FakeBridge())
+    code = "#include <stdio.h>\nint main(){return 0;}"
+    out = build_registry(ctx).get("browser_type").call(text=code)
+    assert "读回确认：2 行" in out, f"应自带读回确认，实际：{out!r}"
+    typed = [p for op, p in calls if op == "type"]
+    assert typed and typed[0]["target"] == "#__ap_editor", "应自动定位到答题编辑器"
+
+
+def test_browser_type_fails_loudly_and_forbids_ctrl_v(ctx, monkeypatch) -> None:
+    """回归（2026-10-22 实测）：扩展返回 OK 但内容是空的，Agent 转头去 Ctrl+V。
+
+    审计日志里的真实轨迹：browser_type OK → eval 发现是空的 → 又试一次 →
+    set_clipboard → browser_press("Control+V") → 页面禁粘贴 → 白烧十几步。
+    现在"写不进去"必须是**明确的失败**，而且要把 Ctrl+V 这条路直接堵死。
+    """
+    from autopilot import actions as A
+
+    class _FakeBridge:
+        port = 1
+        connected = True
+
+        def call(self, op, params=None, timeout=None):  # noqa: ANN001
+            params = params or {}
+            if op == "type":
+                return {"length": len(str(params.get("text") or ""))}   # 送达 ≠ 写进去
+            if op == "eval":
+                script = params.get("script", "")
+                if "usable.length" in script:
+                    return {"found": True, "tag": "DIV"}
+                if "walk(" in script:
+                    return ""                                            # 读回是空的
+                if "monaco" in script:
+                    return ""                                            # 框架 API 也没有
+            return {}
+
+    monkeypatch.setattr(A, "_ext", lambda ctx, wait=5.0: _FakeBridge())
+    with pytest.raises(Exception) as info:
+        build_registry(ctx).get("browser_type").call(text="int main(){return 0;}")
+    msg = str(info.value)
+    assert "写入失败" in msg
+    assert "Ctrl+V" in msg and "不要再试" in msg
+
+
+def test_browser_debug_does_not_hijack_users_current_page(ctx, monkeypatch) -> None:
+    """回归：接管浏览器时**不许**把用户正在看的那一页顶掉。
+
+    实测（2026-10-16）：用户说"把这个页面的作业做了"，agent 第一步就是
+    ``browser_debug(url="https://pintia.cn/")``——同站的作业页被导航走，
+    于是"突然返回到上个界面"；第二次让他做第二个作业时，又从题目集列表里
+    挑回了第一个作业。
+    """
+    from autopilot import actions as A
+
+    calls = []
+
+    class _FakeBridge:
+        port = 1
+        connected = True
+
+        def call(self, op, params=None, timeout=None):  # noqa: ANN001
+            calls.append((op, params or {}))
+            if op == "tabs":
+                return {"count": 1, "tabs": [{
+                    "id": 7, "active": True, "title": "7-2 小于m的最大的10个素数",
+                    "url": "https://pintia.cn/problem-sets/1/exam/problems/type/7?x=2"}]}
+            return {}
+
+    monkeypatch.setattr(A, "_ext", lambda ctx, wait=5.0: _FakeBridge())
+    reg = build_registry(ctx)
+
+    out = reg.get("browser_debug").call(url="https://pintia.cn/")
+    assert "没有跳转" in out, f"同站应明确说明没跳转，实际：{out!r}"
+    assert not [1 for op, _ in calls if op == "goto"], "同站不该跳转"
+
+    calls.clear()
+    out = reg.get("browser_debug").call(url="https://example.com/other")
+    assert "没有动" in out, f"不同站也应说明没动用户的页面，实际：{out!r}"
+    assert not [1 for op, _ in calls if op == "goto"], "不同站也不许顶掉用户的页面"
+
+
+def test_read_image_works_under_extension(ctx, monkeypatch) -> None:
+    """回归：扩展接管时 ``browser_read_image`` 不许再报"当前没有受控浏览器"。
+
+    实测（2026-10-16 19:58）：这个老动作只有 Playwright 一条路，而扩展模式下
+    根本没有 Playwright 页面，于是每次调用都**瞬间失败**，agent 只能换个选择器
+    再撞一次——用户看到的就是"遇到图片就卡在那里"。
+    """
+    from autopilot import actions as A
+
+    class _FakeBridge:
+        port = 1
+        connected = True
+
+        def call(self, op, params=None, timeout=None):  # noqa: ANN001
+            if op == "eval":
+                return '{"found": false}'                # 交给 read_element 去查
+            return {}
+
+    monkeypatch.setattr(A, "_ext", lambda ctx, wait=5.0: _FakeBridge())
+    out = build_registry(ctx).get("browser_read_image").call(selector="img", index=0)
+    assert "没有找到匹配" in str(out), f"应该走扩展通道，实际：{out!r}"
+    assert "没有受控浏览器" not in str(out)
+
+
+def test_commands_carry_pinned_tab_id(ctx, monkeypatch) -> None:
+    """回归：接管之后每条命令都要带**钉住的工作标签页** tabId。
+
+    不给 tabId 时，扩展那边是 ``pickTab()``：用"当前前台窗口的活动标签页"，
+    也就是**用户此刻正在看的那一页**。他随手切个标签、开个新网页，agent 的
+    eval/type/click/截图就全打偏了（截图还会因为那页被遮挡而挂死）。
+    """
+    from autopilot import actions as A
+
+    calls = []
+
+    class _FakeBridge:
+        port = 1
+        connected = True
+
+        def call(self, op, params=None, timeout=None):  # noqa: ANN001
+            calls.append((op, params or {}))
+            if op == "tabs":
+                return {"count": 2, "tabs": [
+                    {"id": 11, "active": True, "title": "作业页",
+                     "url": "https://pintia.cn/a"},
+                    {"id": 22, "active": False, "title": "用户开的新网页",
+                     "url": "https://example.com/b"}]}
+            if op == "eval":
+                return "1"
+            return {}
+
+    monkeypatch.setattr(A, "_ext", lambda ctx, wait=5.0: _FakeBridge())
+    reg = build_registry(ctx)
+    reg.get("browser_debug").call()
+    assert ctx.browser.get("ext_tab") == 11, "接管时应钉住活动标签页"
+
+    reg.get("browser_eval").call(script="1+1")
+    evals = [p for op, p in calls if op == "eval"]
+    assert evals and evals[0].get("tabId") == 11, f"命令必须带 tabId，实际：{evals}"
+
+    # 用户切到别的标签页也不该改变 agent 的工作标签页
+    reg.get("browser_status").call()
+    assert ctx.browser.get("ext_tab") == 11
+
+
 # --------------------------------------------------------------------------
 # 真实浏览器（headless，不干扰使用者）
 # --------------------------------------------------------------------------
@@ -254,20 +454,83 @@ def test_browser_type_clear_first_replaces_old_text(ctx, tmp_path) -> None:
 
 
 @needs_playwright
+def test_browser_type_escalates_when_insert_is_blocked(ctx, tmp_path, monkeypatch) -> None:
+    """禁粘贴的页面：insertText 静默失效时要自动升级为逐键输入。
+
+    真实场景：某些考试页把 paste / insertText 一并拦掉，动作**不报错**、
+    编辑器却还是空的，Agent 会以为"写好了"，然后在提交时才发现没内容。
+    """
+    from autopilot import actions as A
+
+    page_url = _editor_page(tmp_path)
+    reg = build_registry(ctx)
+    profile = str(tmp_path / "prof-escalate")
+    real_reader = A._editor_text
+    state = {"calls": 0}
+
+    def fake_reader(page):
+        state["calls"] += 1
+        return "" if state["calls"] == 1 else real_reader(page)   # 第一次假装没写进去
+
+    monkeypatch.setattr(A, "_editor_text", fake_reader)
+    code = "int main(){return 0;}"
+    try:
+        reg.get("browser_open").call(url=page_url, headless=True, profile=profile)
+        out = reg.get("browser_type").call(target="#ed", text=code, clear_first=True)
+        assert "自动升级" in out, f"应说明已升级通道，实际：{out!r}"
+        got = reg.get("browser_eval").call(script="document.querySelector('#ed').value")
+        squeeze = lambda text: text.replace(" ", "").replace("\n", "")
+        assert squeeze(got) == squeeze(code), got
+    finally:
+        reg.get("browser_close").call(force=True)
+
+
+@needs_playwright
 def test_browser_read_image_ocrs_formula(ctx, tmp_path) -> None:
-    """题目里的公式常是图片，DOM 拿不到文本，得靠放大截图 + OCR。"""
+    """题目里的公式常是图片，DOM 拿不到文本——OCR 兜底路径要能读出公式。"""
     page_url = _editor_page(tmp_path, formula="f(x)=sqrt(x)+2026")
     reg = build_registry(ctx)
     profile = str(tmp_path / "prof-img")
     try:
         reg.get("browser_open").call(url=page_url, headless=True, profile=profile)
-        out = reg.get("browser_read_image").call(index=0, zoom=3)
+        out = reg.get("browser_read_image").call(index=0, method="ocr", zoom=3)
         assert "OCR 结果" in out, out
         assert "sqrt" in out, f"没读出公式：{out}"
 
         # 边界情况要说人话
         assert "越界" in reg.get("browser_read_image").call(index=9)
         assert "没有匹配" in reg.get("browser_read_image").call(selector=".不存在")
+    finally:
+        reg.get("browser_close").call(force=True)
+
+
+@needs_playwright
+def test_browser_read_image_defaults_to_vision(ctx, tmp_path, monkeypatch) -> None:
+    """不指定 method 时走视觉模型，返回里要标明识别方式。
+
+    这里把模型换成假的：真实调用要联网、要 API key，不适合放进测试套件。
+    真实效果是手工实测的——同一张"代码 + 公式"图，OCR 行命中 1/12、视觉 11/12。
+    """
+    from autopilot import actions
+
+    calls: list = []
+
+    def fake_read_image(path, prompt="", workspace=None, **kw):
+        calls.append({"path": str(path), "prompt": prompt})
+        return {"text": "f(x)=sqrt(x)+2026", "ms": 7.0, "usage": {}}
+
+    monkeypatch.setattr(actions.vision, "read_image", fake_read_image)
+
+    page_url = _editor_page(tmp_path, formula="f(x)=sqrt(x)+2026")
+    reg = build_registry(ctx)
+    profile = str(tmp_path / "prof-img-vision")
+    try:
+        reg.get("browser_open").call(url=page_url, headless=True, profile=profile)
+        out = reg.get("browser_read_image").call(index=0)
+        assert "视觉模型" in out, out
+        assert "sqrt" in out
+        assert calls, "应该把截图交给视觉模型"
+        assert calls[0]["path"].endswith(".png"), "PNG 没有 JPEG 块效应，文字更清楚"
     finally:
         reg.get("browser_close").call(force=True)
 

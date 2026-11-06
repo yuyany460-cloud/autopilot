@@ -43,6 +43,19 @@ def ctx(tmp_path: Path, policy: Policy):
         pass
 
 
+@pytest.fixture(autouse=True)
+def _no_browser_extension(monkeypatch) -> None:
+    """让测试永远走 Playwright，不要把动作路由到浏览器扩展去。
+
+    开发机上如果真装了 AutoPilot Bridge 扩展、并且浏览器开着，动作会优先走扩展
+    （操作的是开发者**自己的**浏览器）。那样测试既不可复现，也会真的动到用户的窗口。
+    扩展本身的协议由 ``test_extbridge.py`` 单独测，不依赖这个路由。
+    """
+    from autopilot import actions
+
+    monkeypatch.setattr(actions, "_ext", lambda ctx, wait=1.0: None)
+
+
 @pytest.fixture
 def cursor_guard():
     """保护光标位置：测试结束后复位。"""

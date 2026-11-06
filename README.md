@@ -67,6 +67,48 @@ python -m pip install -e .
 python run.py selfcheck
 ```
 
+### 更短的命令：`ap`
+
+`python -m autopilot do screenshot path=a.png` 敲起来太长了。本机已经装好两个短命令：
+**`ap`**（两个字母）和 **`apilot`**，等价于 `python -m autopilot`，**在任何目录下都能用**。
+
+| 短写 | 等价于 | 说明 |
+| --- | --- | --- |
+| `ap doctor` / `ap dr` | `python -m autopilot doctor` | 环境体检 |
+| `ap a` | `actions` | 列出全部动作 |
+| `ap o` | `observe` | 打印屏幕快照 |
+| `ap d screenshot path=a.png` | `do ...` | 直接执行一个动作 |
+| `ap r "打开记事本写一句"` | `run "..."` | 让 Agent 自主完成 |
+| `ap f list` / `ap f run --file x.json` | `flow ...` | 确定性流程 |
+| `ap sc` | `selfcheck` | 子系统自检 |
+| `ap s` | `serve` | Web 控制台 |
+| `ap cfg` | `config` | 看当前配置 |
+
+子命令都可以只写首字母，`--help` 在任意层级都能用（`ap r --help`）。
+
+> `ap r` 后面**必须跟目标**（`ap r "..."` 或 `ap r @task.txt`）。只敲 `ap r` 会打印用法，
+> 不会瞎跑；只敲 `ap` 会打印总帮助。
+
+**`ap` 提示"不是内部或外部命令"？** PATH 是用户级的，改完之后**已经开着的 cmd 窗口读不到**，
+开一个新的窗口就行；再不行用 `where ap` 确认能否找到 `%USERPROFILE%\bin\ap.cmd`。
+
+
+短命令怎么来的：`%USERPROFILE%\bin\ap.cmd`（和 `apilot.cmd`）调用项目里的
+`run.py`，后者把项目根目录塞进 `sys.path` 再 `chdir` 过去——所以不用 `pip install`，
+`var/logs`、`flows/` 也永远指向项目里的那份。换机器或移动了项目目录时，把这两个
+`.cmd` 里的 `APILOT_ROOT` 改成新路径即可：
+
+```bat
+@echo off
+setlocal
+set "APILOT_ROOT=D:\code\autopilot"
+python -c "import sys" >nul 2>nul && (set "PY=python") || (set "PY=D:\code\python\python.exe")
+"%PY%" "%APILOT_ROOT%\run.py" %*
+```
+
+（`%USERPROFILE%\bin` 已加入**用户级** PATH，新开的 cmd 窗口直接生效，不需要管理员权限。）
+
+
 **可选增强**（不装也能用）：
 
 ```powershell
@@ -74,6 +116,22 @@ pip install pillow mss                  # 更快的图像缩放与截屏
 pip install fastapi uvicorn             # Web 控制台
 pip install playwright                  # 网页自动化（复用系统 Edge，无需下载浏览器）
 ```
+
+### 出问题怎么查
+
+不用靠"盯着 cmd 窗口"，三样东西都在 `var/logs/` 里，窗口滚没了也在：
+
+| 文件 | 内容 | 什么时候看 |
+| --- | --- | --- |
+| `run-YYYYMMDD.log` | **控制台全文**（模型的思考、每一步动作、工具返回、报错），已去掉颜色码 | "它刚才到底干了什么 / 为什么停住了" |
+| `audit-YYYYMMDD.jsonl` | 每一步动作的结构化记录：参数、结果、耗时、是否被拒 | 想按时间线统计、算间隔、看失败原因 |
+| `var/STOP` | 出现这个文件就等于急停 | 想远程叫停，或怀疑被叫停 |
+
+`run-*.log` 默认就写（每次命令追加，超过 5MB 自动滚一个 `.1.log`），
+不想留痕加 `--no-log`。想实时看进度用 `ap s` 打开 Web 控制台。
+
+> 常见的"它不干活"其实只有三种：模型自己 `finish` 结束了（一次性任务，不会待命）、
+> 被 `Ctrl+Alt+Q` 急停、或者卡在某个工具的超时上（`audit` 里最后一条的时间戳会说清）。
 
 ### 配置模型
 
@@ -260,6 +318,54 @@ python examples/pta-auto.py --submit --yes    # 确认无误后再提交        
 `--solve` 会打印每题的选择和一句话理由，**请你复核后**再 `--fill`；
 已有的答案文件会自动备份成 `.json.bak`。
 
+### 读图：公式是图片怎么办
+
+题面里的数学公式基本都是图片，`innerText` 抓不到任何内容——这是"明明看懂了却答错"的
+头号原因。现在 `--dump` 按**由便宜到贵**的三级顺序解决：
+
+| 优先级 | 来源 | 耗时 | 说明 |
+| --- | --- | --- | --- |
+| ① | DOM 里的数学元数据 | **0 ms** | `<img alt>`、`<annotation encoding="…tex">`、MathML；很多站点直接写着 LaTeX |
+| ② | 视觉模型，**一题一次** | ~1.2 s | 题干 + 若干选项图一起送，模型还能靠上下文把形近符号读对 |
+| ③ | Windows 系统 OCR | ~0.6 s | 只在没有视觉能力时兜底 |
+
+同一批真实题目图片（4 张公式）实测：
+
+| 做法 | 耗时 | 与原文相似度 |
+| --- | --- | --- |
+| Windows OCR | 2.0 s | **0.45**（`sin²x`→`sin2x`、`dy/dx`→「迦」） |
+| 视觉模型，一张图一次 | 3.3 s | 0.95 |
+| 视觉模型，一题一次批量 | **1.2 s** | **0.96** |
+| 同一批图再读（缓存命中） | **0.02 s** | 0.96（0 token） |
+
+读回来的文本还会再规范化一遍：LaTeX 的 `\frac{dy}{dx}` → `(dy)/(dx)`、`\sqrt{x}` → `√(x)`，
+统一 Unicode 减号与上标，并且**把图片内容插回它在题干里的原始位置**（`〔图1: …〕`），
+而不是全堆在末尾。识别结果按图片内容哈希缓存在 `var/cache/vision/`，重跑不花钱。
+
+```powershell
+python examples/pta-auto.py --dump --jobs 6     # 6 题同时读图
+```
+
+### 复核：一次调用换一份保险
+
+`--solve` 之后默认还会用**更强的模型独立重做一遍**，再和初答对比：
+
+```powershell
+python examples/pta-auto.py --solve              # 作答 + 复核（默认）
+python examples/pta-auto.py --solve --no-check   # 省掉复核这一次调用
+python examples/pta-auto.py --solve --trust first # 有分歧时保留初答
+```
+
+复核的提示词**刻意不让它先看答案**（先独立解题、再对比），否则它会顺着初答说"对"。
+有分歧的题在控制台标 `⚠`，`answers.json` 里写 `conflict: true` 和 `checked`（复核答案），
+`--fill` 默认采用复核答案并逐条打印分歧，方便你人工定夺。
+
+还可以本地把编程题跑一遍再提交：
+
+```powershell
+python examples/pta-auto.py --verify            # gcc 编译 + 逐组样例比对
+```
+
 答案文件支持按序号或按选项文字模糊匹配：
 
 ```json
@@ -283,6 +389,36 @@ python examples/pta-auto.py --submit --yes    # 确认无误后再提交        
 | `do <动作>` | 直接执行单个动作 | 0 |
 | 自己写脚本调 `autopilot` 的库（如上面的 `pta-auto.py`） | 最灵活 | 0 |
 | `run "..."` | Agent 自主决策 | 按步数计费 |
+
+---
+
+### 页面禁粘贴怎么办
+
+考试页常把 `paste` / `beforeinput` 拦掉，表现是**脚本不报错、编辑器却是空的**
+（有的还会把非键盘输入回滚）。`--fill` 现在走一条**阶梯**，每一步都读回校验，
+不通过才升级，并告诉你最后用的是哪一档：
+
+| 顺序 | 通道 | 原理 | 能过"禁粘贴"吗 |
+| --- | --- | --- | --- |
+| 1 | `api` | Monaco `model.setValue` / CM6 `view.dispatch` / CM5 / textarea 原型 setter | 能，不产生输入事件 |
+| 2 | `insert` | CDP `Input.insertText`（浏览器级文本插入） | 能，不是 paste 事件 |
+| 3 | `exec` | `document.execCommand('insertText')` | 看站点 |
+| 4 | `type` | 逐键输入，最像真人 | 能，连"检测输入来源"也能过 |
+
+```powershell
+python examples/pta-auto.py --fill                     # 自动逐级降级（推荐）
+python examples/pta-auto.py --fill --write-method type --typing-delay 10
+python examples/pta-auto.py --fill --write-method api   # 最快：直接改框架内部值
+```
+
+`apilot` 那条路同理：`browser_type` 默认用 `insert`（CDP 插入），**每次写完都读回校验**，
+没写进去就依次升级到 **框架 API**（Monaco / CM6 dispatch）→ **逐键输入**；
+三档都不行会直接报失败，并明确禁止模型改用"复制 + Ctrl+V"（这类页面正好拦的就是 paste）。
+
+> 顺带修掉一个会让人误判的坑：contenteditable 会把连续空格变成 NBSP（`\u00a0`），
+> 且多行常被折成一行，导致"明明写对了却报读回不一致"。现在读回会按 `<br>` 和
+> 块级子元素还原换行、把 NBSP 归一化成空格；逐行比对失败时再退回"忽略空白"的
+> 兜底比对，并在结果里注明"排版以编辑器显示为准"。
 
 ---
 
@@ -377,6 +513,15 @@ python examples/pta-auto.py --submit --yes    # 确认无误后再提交        
 * **公式是图片，DOM 读不到**：新增 `browser_read_image`（放大后截图 + OCR）。
   提示词里同时写明"别在图片上反复折腾，用样例输入输出反推"——
   这是实测中烧掉最多步数的坑。
+* **题干只要 260 字符**：`--dump` 原来只存 `head`（前 260 字符），长题的
+  "输出格式/数据范围"全被切掉，编程题大面积格式错、单选题按残缺条件硬答。
+  现在存 `blocks`（文字/公式/代码/图片按 DOM 顺序）与全文题干。
+* **OCR 把公式读成另一个东西**：`sin²x`→`sin2x`、`dy/dx`→「迦」，
+  这不是"可能错"而是必错。改成 DOM 元数据 → 视觉模型（一题一次批量）→ OCR 兜底，
+  实测相似度 0.45 → 0.96，速度还快 1.6 倍。
+* **思考模式吃光 `max_tokens`**：给单题 1024 token 时，推理把额度用完、`content`
+  返回空串，`--solve` 直接报"模型没有返回 JSON：（空）"。现在自动关掉思考重发一次。
+
 
 ---
 

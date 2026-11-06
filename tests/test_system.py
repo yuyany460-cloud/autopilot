@@ -295,6 +295,66 @@ def test_list_windows_excludes_noise() -> None:
         assert win.rect.width > 1 and win.rect.height > 1
 
 
+def _fake_win(title: str, width: int = 800, height: int = 600) -> windows.WindowInfo:
+    return windows.WindowInfo(
+        hwnd=1, title=title, class_name="FakeWnd", pid=1,
+        rect=winapi.Rect(0, 0, width, height),
+    )
+
+
+def test_helper_windows_are_recognised() -> None:
+    """程序内部的消息窗口不算"界面"。
+
+    真实踩坑：app_status("uu") 曾经报"在运行，共 8 个窗口"，其中 3 个是
+    CAsyncSocketEx Helper Window、1 个 GDI+ Window (uu.exe)——模型于是以为
+    界面已经开好了，继续在错误的窗口上瞎点。
+    """
+    for title in ("CAsyncSocketEx Helper Window", "GDI+ Window (uu.exe)",
+                  "Default IME", "  ", "ToolTips_Class32"):
+        assert windows.is_helper_window(_fake_win(title)), title
+    assert windows.is_helper_window(_fake_win("真界面", width=1)) is True   # 1 像素不算界面
+    assert windows.is_helper_window(_fake_win("UU加速器")) is False
+    assert windows.is_helper_window(_fake_win("记事本")) is False
+
+
+def test_own_console_window_is_hidden_from_listing() -> None:
+    """自己的终端窗口不能出现在窗口列表里。
+
+    踩过的坑：命令行标题就是整条命令、含任务原文，于是
+    app_status("uu") 会把启动 Agent 的那个终端当成"UU加速器正在运行"。
+    """
+    import subprocess
+
+    marker = "python -m autopilot run 打开uu加速器"      # 含固定特征串 autopilot
+    found = None
+    for _ in range(3):                                   # 系统忙时 start 可能慢，重试几次
+        subprocess.Popen(f'start "{marker}" /MIN cmd /k', shell=True)
+        for _ in range(12):
+            windows.reset_console_cache()
+            for win in windows.list_windows(include_hidden=True, include_own_console=True):
+                if win.process.lower() == "cmd.exe" and marker in win.title:
+                    found = win
+                    break
+            if found:
+                break
+            time.sleep(0.4)
+        if found:
+            break
+
+    try:
+        if found is None:
+            pytest.skip("系统没有及时生成测试用终端窗口")
+        assert found.hwnd in windows.own_console_windows()
+        plain = {w.hwnd for w in windows.list_windows()}
+        assert found.hwnd not in plain, "自己的终端窗口不该出现在 list_windows() 里"
+        with_own = {w.hwnd for w in windows.list_windows(include_own_console=True)}
+        assert found.hwnd in with_own, "显式要求时才列出来"
+    finally:
+        if found:
+            windows.kill_process(found.pid, force=True)
+        windows.reset_console_cache()
+
+
 def test_foreground_window_info() -> None:
     fg = windows.get_foreground()
     if fg is None:
@@ -305,11 +365,17 @@ def test_foreground_window_info() -> None:
 
 
 def test_find_window_by_process() -> None:
-    fg = windows.get_foreground()
-    if fg is None or not fg.process:
-        pytest.skip("没有可用的前台进程")
-    found = windows.find_windows(process=fg.process)
-    assert any(w.hwnd == fg.hwnd for w in found)
+    """按进程名应该能找回一个已知在列表里的窗口。
+
+    注意不能想当然地拿"前台窗口"来测：前台可能是任务栏（Shell_TrayWnd）、
+    输入法、或者我们自己的终端——这些按设计都不在窗口列表里，测试会无故挂掉。
+    """
+    listed = windows.list_windows()
+    if not listed:
+        pytest.skip("当前没有可枚举的窗口")
+    target = listed[0]
+    found = windows.find_windows(process=target.process)
+    assert any(w.hwnd == target.hwnd for w in found)
 
 
 def test_find_missing_window_returns_none() -> None:
@@ -374,3 +440,215 @@ def test_toast_notification() -> None:
 def test_bridge_error_on_missing_script() -> None:
     with pytest.raises(psbridge.BridgeError):
         psbridge.bridge()._run("根本不存在的脚本", {})
+
+
+# --- 按名字找程序 -------------------------------------------------------
+# 为什么要有这个能力：Agent 想启动"知道名字、不知道路径"的程序时，会退化成
+# 用 run_command 递归扫盘 + 翻注册表。实测一次任务在这上面白烧 9 步。
+# 这几个测试用打桩的数据，不依赖本机装了什么。
+
+
+def _stub_pools(monkeypatch, apps=None, menu=None):
+    from autopilot import windows
+
+    monkeypatch.setattr(windows, "_app_cache", dict(apps or {}))
+    monkeypatch.setattr(windows, "_menu_cache", dict(menu or {}))
+    monkeypatch.setattr(windows.shutil, "which", lambda _n: None)
+
+
+def test_find_app_hits_registry_and_start_menu(monkeypatch) -> None:
+    _stub_pools(monkeypatch,
+                apps={"uu.exe": r"C:\Program Files\UU\uu.exe"},
+                menu={"uu加速器": r"C:\Menu\UU加速器.lnk"})
+    from autopilot import windows
+
+    hits = windows.find_app("uu")
+    assert hits, "应该能按名字找到"
+    vias = {h["via"] for h in hits}
+    assert "App Paths" in vias and "开始菜单" in vias
+
+
+def test_find_app_prefers_exact_match(monkeypatch) -> None:
+    _stub_pools(monkeypatch, menu={"steam": r"C:\Menu\Steam.lnk",
+                                   "steam++": r"C:\Menu\Steam++.lnk"})
+    from autopilot import windows
+
+    hits = windows.find_app("steam")
+    assert hits[0]["name"] == "steam", "精确匹配要排在最前"
+
+
+def test_find_app_fuzzy_fallback(monkeypatch) -> None:
+    _stub_pools(monkeypatch, menu={"网易uu加速器": r"C:\Menu\网易UU.lnk"})
+    from autopilot import windows
+
+    assert windows.find_app("uu"), "子串匹配应该能兜住"
+
+
+def test_find_app_empty_and_missing(monkeypatch) -> None:
+    _stub_pools(monkeypatch)
+    from autopilot import windows
+
+    assert windows.find_app("") == []
+    assert windows.find_app("绝对不存在的程序zzz") == []
+
+
+def test_find_app_respects_limit(monkeypatch) -> None:
+    _stub_pools(monkeypatch, menu={f"uu{i}": f"C:\\Menu\\uu{i}.lnk" for i in range(20)})
+    from autopilot import windows
+
+    assert len(windows.find_app("uu", limit=3)) == 3
+
+
+def test_launch_resolves_bare_name(monkeypatch) -> None:
+    """``launch`` 收到裸程序名时要先解析成真实路径再启动。"""
+    from autopilot import windows
+
+    _stub_pools(monkeypatch, menu={"uu加速器": r"C:\Menu\UU加速器.lnk"})
+    called: list[str] = []
+    monkeypatch.setattr(windows.os, "startfile",
+                        lambda p: called.append(str(p)), raising=False)
+    res = windows.launch("uu", wait=0)
+    assert res["resolved_from"] == "uu"
+    assert res["resolved_via"] == "开始菜单"
+    assert called == [r"C:\Menu\UU加速器.lnk"]
+
+
+def test_launch_missing_exe_gives_actionable_error(monkeypatch) -> None:
+    """找不到程序时不能丢原始 FileNotFoundError，要指路。"""
+    from autopilot import windows
+
+    _stub_pools(monkeypatch)
+    with pytest.raises(RuntimeError) as info:
+        windows.launch("绝对不存在zzz", wait=0)
+    msg = str(info.value)
+    assert "find_app" in msg
+    assert "开始菜单" in msg
+    assert "不要" in msg and "递归" in msg
+
+
+def test_launch_does_not_resolve_paths_or_urls(monkeypatch) -> None:
+    """给了带分隔符的路径或 URL 就不该去猜名字。"""
+    from autopilot import windows
+
+    calls: list[str] = []
+    monkeypatch.setattr(windows, "find_app",
+                        lambda *a, **k: calls.append("find_app") or [])
+    monkeypatch.setattr(windows.os, "startfile", lambda p: None, raising=False)
+    windows.launch("https://example.com", wait=0)
+    assert calls == [], "URL 不该走名字解析"
+
+
+# --- 一步到位 -----------------------------------------------------------
+
+
+def test_app_status_answers_everything_in_one_call(ctx) -> None:
+    """一次问清"装在哪 / 在不在跑 / 窗口在哪"，省掉 list_processes 再自己翻。"""
+    from autopilot.actions import build_registry
+
+    reg = build_registry(ctx)
+    out = reg.get("app_status").call(name="notepad")
+    assert "安装位置" in out
+    assert "运行状态" in out
+    assert "notepad" in out.lower()
+
+
+def test_app_status_handles_unknown_program(ctx) -> None:
+    from autopilot.actions import build_registry
+
+    out = build_registry(ctx).get("app_status").call(name="绝对不存在zzz")
+    assert "没找到" in out
+    assert "没有在运行" in out
+
+
+def test_app_status_requires_name(ctx) -> None:
+    from autopilot.actions import build_registry
+
+    with pytest.raises(ValueError):
+        build_registry(ctx).get("app_status").call(name="  ")
+
+
+def test_list_processes_matches_window_titles(ctx) -> None:
+    """进程名是英文、界面名是中文的程序也要能搜到。"""
+    from autopilot.actions import build_registry
+
+    out = build_registry(ctx).get("list_processes").call(filter="explorer", top=5)
+    assert isinstance(out, str) and out
+
+
+def test_list_processes_miss_gives_next_step(ctx) -> None:
+    from autopilot.actions import build_registry
+
+    out = build_registry(ctx).get("list_processes").call(filter="绝对不存在的进程zzz")
+    assert "没有匹配" in out
+    assert "app_status" in out, "找不到时要指路，而不是让模型继续瞎试"
+
+
+def test_launch_app_exposes_wait_title(ctx) -> None:
+    """「启动并确认可用」要能一步做到。"""
+    from autopilot.actions import build_registry
+
+    spec = {p.name for p in build_registry(ctx).get("launch_app").params}
+    assert {"target", "wait_title", "focus"} <= spec
+
+
+# --- run_command 的传参/编码 -------------------------------------------------
+# 这三个 bug 让一次真实任务里 9 条命令全部静默失效，必须钉死。
+
+
+def test_normalize_shell_unwraps_powershell_in_cmd() -> None:
+    """模型爱写 run_command('powershell -Command "..."', shell="cmd")，
+    cmd 会把内层引号吃掉、$_ 变空。必须自动纠正成直接跑 PowerShell。"""
+    from autopilot.actions import _normalize_shell
+
+    cases = [
+        ('powershell -Command "Get-ChildItem | Where-Object { $_.Name -match \'a\' }"',
+         "Get-ChildItem | Where-Object { $_.Name -match 'a' }"),
+        ('powershell -NoProfile -Command "$x=1; Write-Output $x"',
+         "$x=1; Write-Output $x"),
+        ('pwsh -c "Write-Output 1"', "Write-Output 1"),
+        ('powershell.exe -ExecutionPolicy Bypass -Command "echo hi"', "echo hi"),
+    ]
+    for raw, expect_inner in cases:
+        text, shell = _normalize_shell(raw, "cmd")
+        assert shell == "powershell", f"没纠正：{raw}"
+        assert text == expect_inner, f"{text!r} != {expect_inner!r}"
+
+
+def test_normalize_shell_leaves_plain_commands_alone() -> None:
+    from autopilot.actions import _normalize_shell
+
+    assert _normalize_shell("dir /b", "cmd") == ("dir /b", "cmd")
+    assert _normalize_shell("echo hi", "cmd") == ("echo hi", "cmd")
+    # 已经指明 powershell 的，原样保留
+    assert _normalize_shell("$x=1", "powershell") == ("$x=1", "powershell")
+
+
+def test_decode_explicit_encoding_beats_heuristic() -> None:
+    """GBK 的某些字节恰好是合法 UTF-8（"值" = D6 B5 → U+05B5）。
+
+    所以"先试 UTF-8"的启发式必然出错，能确定编码的地方必须显式指定。
+    """
+    from autopilot.actions import _decode
+
+    raw = "值=5".encode("gbk")
+    assert _decode(raw, "cp936") == "值=5"
+    assert _decode(raw) != "值=5", "启发式确实会解错，所以才必须显式传编码"
+
+
+def test_clean_clixml_extracts_real_error() -> None:
+    """PowerShell 重定向 stderr 时吐的是 CLIXML，要还原成人能读的错误。"""
+    from autopilot.actions import _clean_clixml
+
+    raw = ('#< CLIXML\n<Objs Version="1.1.0.1"><S S="Error">找不到路径_x000D__x000A_'
+           '请检查后再试_x000D__x000A_</S></Objs>')
+    out = _clean_clixml(raw)
+    assert "找不到路径" in out
+    assert "CLIXML" not in out
+    assert "_x000D_" not in out
+    assert "\n" in out, "换行转义要还原"
+
+
+def test_clean_clixml_passes_plain_text_through() -> None:
+    from autopilot.actions import _clean_clixml
+
+    assert _clean_clixml("普通错误") == "普通错误"

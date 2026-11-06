@@ -174,6 +174,79 @@ def resolve_model(workspace: str | Path | None = None) -> str:
     return DEFAULT_MODEL
 
 
+# 复核用的模型：比 flash 强一档，专门用来独立重做一遍关键判断。
+# 一次复核大约 2000 输入 + 500 输出 token，空闲时段约 0.016 元——
+# 用在"提交不可逆"和"拿不准"的场合非常划算。
+REVIEW_MODEL = "deepseek-v4-pro"
+
+
+def review(question: str, my_answer: str = "", context: str = "",
+           workspace: str | Path | None = None,
+           model: str = REVIEW_MODEL, max_tokens: int = 8000) -> LLMResponse:
+    """让更强的模型**先独立作答**，再和 ``my_answer`` 对比。
+
+    关键是顺序：必须让它先自己判断，再比对。反过来问"这个答案对吗"，
+    它会顺着你的答案说"对"——那就白复核了。
+
+    ``max_tokens`` 要给足：pro 默认开思考模式，思维链按 completion token 计费。
+    实测给 1600 时，光推理就把额度用光、``content`` 直接返回空
+    （usage 里 completion=1600 而 reasoning=1600，一个字答案都没有）。
+    """
+    prompt = (
+        "你是一位严谨的阅卷老师，正在独立复核一道题。\n"
+        "**必须按下面的顺序，不要跳步：**\n"
+        "1. 先完全独立地解题，不要参考任何人给出的答案。把你的推理过程写清楚，"
+        "每一步都要有依据（定义、定理、极限计算…）。\n"
+        "2. 得出你自己的答案。\n"
+        "3. 最后才和下面的「待复核答案」对比，明确写出是否一致；"
+        "如果不一致，指出对方错在哪一步。\n\n"
+        f"# 题目\n{question}\n"
+    )
+    if context:
+        prompt += f"\n# 补充信息\n{context}\n"
+    if my_answer:
+        prompt += (f"\n# 待复核答案（第 3 步之前不要看它）\n{my_answer}\n"
+                   f"\n最后一行必须严格用这个格式：`结论：一致` 或 `结论：不一致（正确答案是 X）`")
+    else:
+        prompt += "\n最后一行必须严格用这个格式：`结论：正确答案是 X`"
+
+    cfg = LLMConfig(
+        model=model or REVIEW_MODEL,
+        base_url=resolve_base_url(workspace),
+        api_key=resolve_api_key(workspace),
+        max_tokens=max_tokens,
+        # 复核需要思考（要真算一遍），但不需要 high。实测同一道题：
+        #   effort=high  23.0s / 1778 推理 token
+        #   effort=low   12.0s /  879 推理 token   ← 结论一样且正确
+        extra_body={"reasoning_effort": "low"},
+    ).resolved()
+    if not cfg.api_key:
+        raise LLMError("没有配置 API 密钥，无法复核")
+    try:
+        out = LLMClient(cfg, workspace=workspace).chat(
+            [{"role": "user", "content": prompt}], temperature=0.0)
+    except LLMError:
+        if cfg.model == resolve_model(workspace):
+            raise
+        # 拿不到更强的模型就退回默认模型：复核弱一点，总比不复核强
+        cfg.model = resolve_model(workspace)
+        out = LLMClient(cfg, workspace=workspace).chat(
+            [{"role": "user", "content": prompt}], temperature=0.0)
+    if not (out.content or "").strip():
+        # pro 的思考模式能把输出额度整个吃干净、content 返回空——实测给到 8000
+        # 仍然 completion=8000 / reasoning=8000，一个字答案都没有（2026-10-19 22:10 两次都这样）。
+        # 复核要的是**结论**不是推理过程：关掉思考再问一次，基本一定拿得到答案。
+        # 这一步很关键：复核失败会卡住"提交前必须复核"的强制流程，整个任务就交不上去了。
+        cfg.extra_body = {"thinking": {"type": "disabled"}}
+        out = LLMClient(cfg, workspace=workspace).chat(
+            [{"role": "user", "content": prompt}], temperature=0.0)
+        if not (out.content or "").strip():
+            raise LLMError(
+                f"复核模型关掉思考后仍未给出答案（completion="
+                f"{out.usage.get('completion_tokens')}）。换个模型或稍后重试。")
+    return out
+
+
 # --------------------------------------------------------------------------
 # 客户端
 # --------------------------------------------------------------------------

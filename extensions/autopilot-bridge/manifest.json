@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "AutoPilot Bridge",
+  "version": "1.0.2",
+  "description": "让 AutoPilot 直接接管这个浏览器里已经打开的标签页：不用调试端口、不用重开、不用重新登录。",
+  "minimum_chrome_version": "116",
+  "permissions": ["tabs", "scripting", "debugger", "storage", "alarms"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["keepalive.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "AutoPilot Bridge"
+  }
+}

@@ -30,6 +30,8 @@ def _build(ctx, auto_observe: str = "none") -> Executor:
     reg.register(Action("dangerous", "危险动作", [], lambda: "不该执行", Danger.HIGH))
     reg.register(Action("readonly_thing", "只读", [], lambda: "读了", Danger.SAFE,
                         mutates=False))
+    reg.register(Action("no_reobserve", "改状态但不重新感知", [], lambda: "改了", Danger.LOW,
+                        observe="none"))
     ex = Executor(reg, ctx, audit=AuditLog(ctx.workspace / "var" / "logs"),
                   auto_observe=auto_observe, log=lambda l, m: None)
     ex.calls = calls  # type: ignore[attr-defined]
@@ -155,3 +157,54 @@ def test_result_to_text_is_readable(ctx) -> None:
     assert "✅" in ex.run("ok_action", {}).to_text()
     assert "❌" in ex.run("boom", {}).to_text()
     assert "被安全策略拒绝" in ex.run("dangerous", {}).to_text()
+
+
+# --------------------------------------------------------------------------
+# 自动重新感知：一步省 0.45~1.28 秒的地方
+#
+# 一次全屏感知实测 1.28s（UIA 0.45 + 系统 OCR 0.75 + 存图 0.10），
+# 而默认 auto_observe="full" 意味着**每一个**改状态的动作后面都跟着一次。
+# 动作可以用 observe="none" 声明跳过——浏览器动作全靠这个。
+# --------------------------------------------------------------------------
+
+
+def _tiny_snapshot():
+    import time
+
+    from autopilot.perceive import Snapshot
+
+    return Snapshot(ts=time.time(), screen_size=(1, 1), cursor=(0, 0), scale=1.0,
+                    foreground=None, window_list=[], elements=[])
+
+
+def test_mutating_action_reobserves_by_default(ctx) -> None:
+    ex = _build(ctx, auto_observe="full")
+    hits: list[int] = []
+    ex._observe = lambda: (hits.append(1), _tiny_snapshot())[1]
+    ex.run("ok_action", {})
+    assert hits, "改了系统状态就该重新看一眼"
+
+
+def test_action_can_opt_out_of_reobservation(ctx) -> None:
+    ex = _build(ctx, auto_observe="full")
+    hits: list[int] = []
+    ex._observe = lambda: (hits.append(1), _tiny_snapshot())[1]
+    result = ex.run("no_reobserve", {})
+    assert result.ok
+    assert not hits, "声明 observe='none' 的动作不该再跑一次全屏感知"
+
+
+def test_browser_actions_skip_desktop_observation(ctx) -> None:
+    """浏览器动作必须声明 observe="none"。
+
+    网页内容不在桌面元素树里，跑一次 UIA+OCR 既贵又没用；
+    实测 browser_eval 求一个 JS 表达式：带感知 455ms，不带 2ms。
+    """
+    from autopilot.actions import build_registry
+
+    reg = build_registry(ctx)
+    for name in ("browser_debug", "browser_goto", "browser_click", "browser_fill",
+                 "browser_press", "browser_type", "browser_eval"):
+        act = reg.get(name)
+        assert act is not None, f"缺少动作 {name}"
+        assert act.observe == "none", f"{name} 每步会白跑一次全屏感知"

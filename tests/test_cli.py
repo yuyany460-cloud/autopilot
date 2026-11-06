@@ -108,3 +108,83 @@ def test_at_file_quoted_path(tmp_path: Path, monkeypatch) -> None:
     f.write_text("带空格的文件名", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     assert _resolve_goal(_args(goal='@"my task.txt"')) == "带空格的文件名"
+
+# --- 短命令别名 ---------------------------------------------------------
+
+
+def test_aliases_resolve_to_the_same_command() -> None:
+    """`ap a` / `ap r "目标"` 这类短写必须和完整子命令等价。
+
+    理由很实际：cmd 里 `python -m autopilot do screenshot path=a.png` 太长，
+    日常真正会敲的是 `ap d screenshot path=a.png`。
+    """
+    from autopilot.cli import COMMAND_ALIASES, build_parser
+
+    parser = build_parser()
+    for alias, canonical in COMMAND_ALIASES.items():
+        args = [alias]
+        if canonical == "do":
+            args.append("screenshot")
+        elif canonical == "flow":
+            args.append("list")
+        elif canonical == "run":
+            args.append("打开记事本")
+        parsed = parser.parse_args(args)
+        assert parsed.command in (alias, canonical), f"{alias} 没解析成 {canonical}"
+        assert callable(parsed.func), alias
+
+
+def test_run_alias_keeps_goal_text() -> None:
+    from autopilot.cli import build_parser
+
+    parsed = build_parser().parse_args(["r", "把桌面上的 txt 重命名"])
+    assert parsed.goal == "把桌面上的 txt 重命名"
+    assert parsed.max_steps == 100
+
+# --- 控制台输出落盘（cmd 窗口滚没了还能查） -----------------------------
+
+
+def test_tee_duplicates_writes(tmp_path) -> None:
+    from autopilot.cli import _Tee
+
+    class _Sink:
+        def __init__(self) -> None:
+            self.data = ""
+
+        def write(self, text):
+            self.data += text
+            return len(text)
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+    stream, record = _Sink(), _Sink()
+    tee = _Tee(stream, record)
+    tee.write("你好")
+    tee.flush()
+    assert stream.data == "你好" and record.data == "你好"
+    assert tee.isatty() is False
+
+
+def test_run_log_contains_console_output(tmp_path) -> None:
+    """`ap cfg` 这类命令也要留一份日志：事后能查"它到底打印了什么"。"""
+    from datetime import datetime
+
+    from autopilot.cli import main
+
+    rc = main(["config", "--workspace", str(tmp_path)])
+    assert rc == 0
+    log = tmp_path / "var" / "logs" / f"run-{datetime.now():%Y%m%d}.log"
+    assert log.is_file(), "应生成 var/logs/run-*.log"
+    text = log.read_text(encoding="utf-8")
+    assert "工作目录" in text and str(tmp_path) in text
+
+
+def test_no_log_flag_skips_log(tmp_path) -> None:
+    from autopilot.cli import main
+
+    assert main(["config", "--workspace", str(tmp_path), "--no-log"]) == 0
+    assert not list((tmp_path / "var" / "logs").glob("run-*.log"))

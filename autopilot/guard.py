@@ -102,7 +102,7 @@ class Policy:
     mode: str = "auto"                 # auto | confirm | readonly
     allow_danger: bool = False         # 是否允许 HIGH 级动作
     dry_run: bool = False              # 只报告不执行
-    max_steps: int = 40                # 单次任务最多多少步
+    max_steps: int = 100               # 单次任务最多多少步
     action_timeout: float = 120.0
     extra_blocked: list[str] = field(default_factory=list)
     extra_blocked_reasons: dict[str, str] = field(default_factory=dict)

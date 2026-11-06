@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as w
+import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from . import winapi
@@ -122,17 +125,140 @@ def _is_noise(class_name: str) -> bool:
     return False
 
 
-def list_windows(include_hidden: bool = False, with_process: bool = True) -> list[WindowInfo]:
-    """枚举所有顶层窗口，按"最可能被用户看见"的程度排序。"""
+# 程序内部的消息窗口：它们也是"有标题的可见窗口"，但对用户毫无意义。
+# 例：uu.exe 会登记 CAsyncSocketEx Helper Window ×3、GDI+ Window (uu.exe)。
+# 不排掉的话，app_status("uu") 会报"在运行，共 8 个窗口"，模型就以为界面已经开了。
+_HELPER_TITLE_MARKERS = (
+    "helper window", "default ime", "gdi+ window", "olemainthreadwnd",
+    "tooltips_class32", "program manager", "msctfime", "ime window",
+    "windows shell experience", "nvidia share", "hidden window", "message window",
+)
+
+
+def is_helper_window(win: WindowInfo) -> bool:
+    """判断"这不是一个用户能看见的界面"。
+
+    app_status 用它把后台辅助窗口滤掉；否则模型会把它们当成已经打开的界面。
+    """
+    title = (win.title or "").strip().lower()
+    if not title:
+        return True
+    if any(m in title for m in _HELPER_TITLE_MARKERS):
+        return True
+    if win.rect.width <= 1 or win.rect.height <= 1:
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# 识别"我们自己的终端窗口"
+#
+# 踩过的坑：Agent 是从命令行启动的，那个 cmd/WindowsTerminal 窗口的**标题
+# 就是整条命令行**，里面当然包含任务目标里的字。于是：
+#   - app_status("uu") 会把它当成"UU加速器正在运行"
+#   - launch_app 等窗口时也会先等到它，然后报"已切到前台"（其实是切到自己终端）
+# 结果模型完全搞不清自己在操作哪个窗口。
+#
+# 这些窗口对任何任务都不是目标，直接排除。
+# --------------------------------------------------------------------------
+
+CONSOLE_PROCESSES = {
+    "cmd.exe", "conhost.exe", "openconsole.exe", "windowsterminal.exe", "wt.exe",
+    "powershell.exe", "pwsh.exe", "bash.exe", "wsl.exe", "mintty.exe",
+}
+
+_own_console_cache: set[int] | None = None
+
+
+def own_console_markers() -> list[str]:
+    """从自己的命令行里取特征串（长参数就是最好的指纹，比如整段任务目标）。"""
+    import sys
+
+    markers: list[str] = []
+    try:
+        markers.extend(a.lower() for a in sys.argv if len(a) >= 10)
+    except Exception:
+        pass
+    markers.append("autopilot")          # 我们的调用方式总带这个词
+    return markers
+
+
+def own_console_windows() -> set[int]:
+    """返回属于本次运行的终端窗口句柄集合（结果会缓存）。
+
+    判据：**控制台类进程 + 标题里带我们的命令行特征串**。
+
+    为什么不用进程祖先链：Win11 下 ``GetConsoleWindow()`` 返回的是隐藏的
+    PseudoConsoleWindow，真正可见的窗口属于 WindowsTerminal.exe；而中间那层
+    shell 往往已经退出，血缘链是断的（实测）。标题才是一直在的指纹——
+    cmd/终端会把正在跑的命令行写进标题，所以"autopilot"必然出现在里面。
+
+    注意：这里**不能**调 ``list_windows``——那个函数要用本函数的结果，
+    会造成无限递归。所以自己枚举一遍。
+    """
+    global _own_console_cache
+    if _own_console_cache is not None:
+        return _own_console_cache
+
+    handles: set[int] = set()
+    try:                                   # 经典控制台直接问系统
+        hwnd = int(ctypes.windll.kernel32.GetConsoleWindow() or 0)
+        if hwnd:
+            handles.add(hwnd)
+    except Exception:
+        pass
+
+    markers = own_console_markers()
+
+    def _cb(hwnd, _lp):
+        hwnd = int(hwnd)
+        try:
+            pid = winapi.get_window_pid(hwnd)
+            if winapi.process_name(pid).lower() not in CONSOLE_PROCESSES:
+                return True
+            title = winapi.get_window_text(hwnd).lower()
+            if title and any(m in title for m in markers):
+                handles.add(hwnd)
+        except Exception:
+            pass
+        return True
+
+    if winapi.IS_WINDOWS:
+        try:
+            _user32.EnumWindows(ctypes.WINFUNCTYPE(w.BOOL, ctypes.c_void_p, w.LPARAM)(_cb), 0)
+        except Exception:
+            pass
+
+    _own_console_cache = handles
+    return handles
+
+
+def reset_console_cache() -> None:
+    """命令行标题会随任务变化，长任务里重新识别一次。"""
+    global _own_console_cache
+    _own_console_cache = None
+
+
+
+def list_windows(include_hidden: bool = False, with_process: bool = True,
+                 include_own_console: bool = False) -> list[WindowInfo]:
+    """枚举所有顶层窗口，按"最可能被用户看见"的程度排序。
+
+    ``include_own_console=False``（默认）会剔除启动本 Agent 的那个终端窗口——
+    它的标题就是整条命令行、含任务原文，留着会污染一切按标题的匹配。
+    """
     winapi.enable_dpi_awareness()
     result: list[WindowInfo] = []
     fg = winapi.get_foreground_window()
     _pid_cache: dict[int, str] = {}
+    own = set() if include_own_console else own_console_windows()
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(w.BOOL, ctypes.c_void_p, w.LPARAM)
 
     def _cb(hwnd, _lparam):
         hwnd = int(hwnd)
+        if hwnd in own:
+            return True
         visible = winapi.is_visible(hwnd)
         if not visible and not include_hidden:
             return True
@@ -186,13 +312,14 @@ def get_foreground() -> WindowInfo | None:
 
 
 def find_windows(pattern: str = "", process: str = "", class_name: str = "",
-                 exact: bool = False) -> list[WindowInfo]:
+                 exact: bool = False, include_own_console: bool = False) -> list[WindowInfo]:
     """按标题 / 进程名 / 类名模糊查找窗口（不区分大小写）。"""
     pat = pattern.lower()
     proc = process.lower()
     cls = class_name.lower()
     out = []
-    for win in list_windows(include_hidden=bool(proc or cls)):
+    for win in list_windows(include_hidden=bool(proc or cls),
+                            include_own_console=include_own_console):
         if pat:
             title = win.title.lower()
             if (title != pat) if exact else (pat not in title):
@@ -205,9 +332,11 @@ def find_windows(pattern: str = "", process: str = "", class_name: str = "",
     return out
 
 
-def find_window(pattern: str = "", process: str = "", class_name: str = "") -> WindowInfo | None:
+def find_window(pattern: str = "", process: str = "", class_name: str = "",
+                include_own_console: bool = False) -> WindowInfo | None:
     """找最合适的一个窗口：优先前台且标题精确匹配的。"""
-    wins = find_windows(pattern, process, class_name)
+    wins = find_windows(pattern, process, class_name,
+                        include_own_console=include_own_console)
     if not wins:
         return None
     pat = pattern.lower()
@@ -327,6 +456,135 @@ def close_window(hwnd: int, force: bool = False) -> bool:
 CREATE_NEW_CONSOLE = 0x00000010
 SW_SHOWNORMAL_ = 1
 
+# --------------------------------------------------------------------------
+# 按名字找程序
+#
+# 为什么需要它：Agent 想启动一个"知道名字、不知道路径"的程序时，
+# 会退化成用 run_command 递归扫盘、翻注册表——实测一次任务在这上面
+# 烧掉了 9 步（还踩了新版 Windows 已移除 wmic 的坑）。
+# 这里把 Windows 自己那套查找顺序封装成一步：PATH → App Paths → 开始菜单。
+# --------------------------------------------------------------------------
+
+_APP_PATHS_SUBKEYS = (
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
+    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths",
+)
+
+_START_MENU_DIRS = (
+    r"%ProgramData%\Microsoft\Windows\Start Menu\Programs",
+    r"%APPDATA%\Microsoft\Windows\Start Menu\Programs",
+)
+
+_app_cache: dict[str, str] | None = None
+_menu_cache: dict[str, str] | None = None
+
+
+def registry_app_paths() -> dict[str, str]:
+    """``App Paths`` 注册表：Windows 记录"程序名 -> 完整路径"的官方位置。"""
+    global _app_cache
+    if _app_cache is not None:
+        return _app_cache
+    import winreg
+
+    found: dict[str, str] = {}
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for sub in _APP_PATHS_SUBKEYS:
+            try:
+                with winreg.OpenKey(root, sub) as key:
+                    for i in range(winreg.QueryInfoKey(key)[0]):
+                        try:
+                            name = winreg.EnumKey(key, i)
+                            with winreg.OpenKey(key, name) as item:
+                                path, _ = winreg.QueryValueEx(item, "")
+                            if path:
+                                found.setdefault(name.lower(), str(path).strip('"'))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    _app_cache = found
+    return found
+
+
+def start_menu_shortcuts() -> dict[str, str]:
+    """开始菜单里的快捷方式——装在 Program Files 的程序基本都能在这找到。"""
+    global _menu_cache
+    if _menu_cache is not None:
+        return _menu_cache
+    found: dict[str, str] = {}
+    for raw in _START_MENU_DIRS:
+        base = Path(os.path.expandvars(raw))
+        if not base.is_dir():
+            continue
+        try:
+            for lnk in base.rglob("*.lnk"):
+                found.setdefault(lnk.stem.lower(), str(lnk))
+        except OSError:
+            continue
+    _menu_cache = found
+    return found
+
+
+def find_app(name: str, limit: int = 8) -> list[dict[str, str]]:
+    """按名字找可启动项，返回 ``[{"name","path","via"}]``。
+
+    查找顺序和 Windows 自己一致：PATH → App Paths → 开始菜单，
+    最后再按子串模糊匹配兜底。
+    """
+    needle = str(name).strip().strip('"')
+    if not needle:
+        return []
+    low = needle.lower()
+    stem = low[:-4] if low.endswith(".exe") else low
+
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(n: str, p: str, via: str) -> None:
+        key = str(p).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"name": n, "path": str(p), "via": via})
+
+    direct = shutil.which(needle) or shutil.which(stem) or shutil.which(stem + ".exe")
+    if direct:
+        add(needle, direct, "PATH")
+    else:
+        for cand in (needle, stem, stem + ".exe"):
+            p = Path(cand)
+            if p.is_file():
+                add(needle, str(p.resolve()), "路径")
+                break
+
+    apps = registry_app_paths()
+    for key in (low, stem + ".exe", stem):
+        if key in apps:
+            add(key, apps[key], "App Paths")
+
+    menu = start_menu_shortcuts()
+    for key in (low, stem):
+        if key in menu:
+            add(key, menu[key], "开始菜单")
+
+    if len(out) < limit:                      # 子串模糊兜底
+        for pool, via in ((apps, "App Paths"), (menu, "开始菜单")):
+            for k, v in sorted(pool.items()):
+                if stem and stem in k:
+                    add(k, v, via)
+                    if len(out) >= limit:
+                        break
+            if len(out) >= limit:
+                break
+
+    # 名字最贴近的排前面
+    out.sort(key=lambda x: (stem not in x["name"].lower(), len(x["name"])))
+    return out[:limit]
+
+
+def _is_url_or_shell(target: str) -> bool:
+    return target.lower().startswith(("http://", "https://", "shell:", "ms-", "mailto:"))
+
 
 def launch(target: str, args: list[str] | None = None, wait: float = 1.0,
            cwd: str | None = None) -> dict[str, Any]:
@@ -334,24 +592,48 @@ def launch(target: str, args: list[str] | None = None, wait: float = 1.0,
 
     对 ``.lnk``、文档、URL 走 ``ShellExecute``（和双击效果一致）；
     对可执行文件走 ``CreateProcess``。
+
+    ``target`` 可以只给**程序名**（如 ``"uu"``）——会自动去 PATH、
+    App Paths 注册表和开始菜单里找，省掉一长串"找它在哪"的探索。
     """
     args = args or []
+    resolved_from = ""
+    resolved_via = ""
+
+    if (not args and not _is_url_or_shell(target)
+            and not _looks_like_document(target)
+            and not os.path.sep in str(target) and "/" not in str(target)):
+        hits = find_app(str(target))
+        if hits:
+            resolved_from, resolved_via = target, hits[0]["via"]
+            target = hits[0]["path"]
+
     if not args and (target.lower().endswith((".lnk", ".url"))
-                     or target.lower().startswith(("http://", "https://", "shell:", "ms-"))
+                     or _is_url_or_shell(target)
                      or _looks_like_document(target)):
         try:
-            import os
             os.startfile(target)  # type: ignore[attr-defined]
             time.sleep(wait)
-            return {"launched": target, "via": "shell", "pid": None}
+            return {"launched": target, "via": "shell", "pid": None,
+                    "resolved_from": resolved_from, "resolved_via": resolved_via}
         except OSError as exc:
             raise RuntimeError(f"无法打开 {target!r}：{exc}") from exc
 
     cmd = subprocess.list2cmdline([target, *args])
-    proc = subprocess.Popen(cmd, cwd=cwd, shell=False,
-                            creationflags=CREATE_NEW_CONSOLE)
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, shell=False,
+                                creationflags=CREATE_NEW_CONSOLE)
+    except FileNotFoundError as exc:
+        # 别把原始堆栈丢给模型——它看不懂，而且会退化成"用 run_command 满盘找"。
+        raise RuntimeError(
+            f"找不到可执行文件 {target!r}。"
+            f"如果它是已安装的程序，直接给程序名就行（如 \"uu\"、\"steam\"、\"微信\"），"
+            f"系统会自动去 PATH / App Paths / 开始菜单里找；"
+            f"也可以先用 find_app 动作查询它在哪。"
+            f"**不要**用 run_command 递归扫描磁盘去找程序。") from exc
     time.sleep(wait)
-    return {"launched": target, "via": "exec", "pid": proc.pid, "args": args}
+    return {"launched": target, "via": "exec", "pid": proc.pid, "args": args,
+            "resolved_from": resolved_from, "resolved_via": resolved_via}
 
 
 def _looks_like_document(target: str) -> bool:
@@ -422,11 +704,11 @@ def ensure_clickable(x: int, y: int, settle: float = 0.25) -> WindowInfo | None:
 
 
 def wait_for_window(pattern: str = "", process: str = "", timeout: float = 15.0,
-                    interval: float = 0.4) -> WindowInfo | None:
+                    interval: float = 0.4, include_own_console: bool = False) -> WindowInfo | None:
     """等到某个窗口出现，返回它；超时返回 ``None``。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        win = find_window(pattern, process)
+        win = find_window(pattern, process, include_own_console=include_own_console)
         if win:
             return win
         time.sleep(interval)

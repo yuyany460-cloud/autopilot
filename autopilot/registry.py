@@ -22,6 +22,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterable
 
+# 字符串形式的布尔值。模型走 function calling 时经常把布尔写成字符串，
+# 而 ``bool("false")`` 是 True——"不要强制结束进程"会变成"强制结束"。必须显式解析。
+_TRUE_TEXT = frozenset({"1", "true", "yes", "y", "on", "t", "是", "真"})
+_FALSE_TEXT = frozenset({"0", "false", "no", "n", "off", "f", "否", "假", "", "none", "null"})
+
 
 class Danger(str, Enum):
     SAFE = "safe"
@@ -72,6 +77,50 @@ class Param:
             schema["default"] = self.default
         return schema
 
+    def coerce(self, value: Any) -> Any:
+        """把模型给的参数值转成声明类型。
+
+        模型经常把 ``false`` 写成字符串 ``"false"``，而 ``bool("false")`` 是 True——
+        ``kill_process(force="false")`` 会真的强杀、``browser_type(clear_first="false")``
+        会清空编辑器。这类"反着执行"的 bug 必须在入口处掐掉。
+
+        转换失败时原样返回：让 handler 自己报错，比在这里静默改成默认值更容易排查。
+        """
+        if value is None:
+            return None
+        kind = _JSON_TYPES.get(self.type, "string")
+        try:
+            if kind == "boolean":
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                text = str(value).strip().lower()
+                if text in _TRUE_TEXT:
+                    return True
+                if text in _FALSE_TEXT:
+                    return False
+                return bool(value)
+            if kind == "integer":
+                if isinstance(value, bool):
+                    return int(value)
+                if isinstance(value, int):
+                    return value
+                return int(float(str(value).strip()))
+            if kind == "number":
+                if isinstance(value, bool):
+                    return float(value)
+                return float(str(value).strip())
+            if kind == "string":
+                return value if isinstance(value, str) else str(value) if _scalar(value) else value
+        except (TypeError, ValueError):
+            return value
+        return value
+
+
+def _scalar(value: Any) -> bool:
+    return isinstance(value, (int, float, bool))
+
 
 @dataclass
 class Action:
@@ -87,6 +136,7 @@ class Action:
     aliases: list[str] = field(default_factory=list)
     mutates: bool = True      # 是否改变系统状态（决定执行后要不要重新感知）
     long_running: bool = False  # 是否可能耗时较久（用更长的超时）
+    observe: str = ""         # 动作执行后怎么感知：""=跟随执行器设置，"none"=跳过
 
     def schema(self) -> dict[str, Any]:
         props: dict[str, Any] = {}
@@ -114,12 +164,14 @@ class Action:
         }
 
     def call(self, **kwargs: Any) -> Any:
-        """按声明清洗参数后调用（丢弃未声明参数、填充默认值）。"""
+        """按声明清洗参数后调用（丢弃未声明参数、填充默认值、按声明类型强转）。"""
         accepted = {p.name for p in self.params}
         clean = {k: v for k, v in kwargs.items() if k in accepted}
         for p in self.params:
             if p.name not in clean and p.default is not None:
                 clean[p.name] = p.default
+            elif p.name in clean:
+                clean[p.name] = p.coerce(clean[p.name])
         missing = [p.name for p in self.params if p.required and clean.get(p.name) in (None, "")]
         if missing:
             raise ValueError(f"动作 {self.name} 缺少必填参数：{', '.join(missing)}")
@@ -155,7 +207,7 @@ class Registry:
     def action(self, name: str, description: str, params: Iterable[Param] | None = None,
                danger: Danger = Danger.SAFE, category: str = "general",
                returns: str = "", aliases: Iterable[str] | None = None,
-               mutates: bool = True, long_running: bool = False):
+               mutates: bool = True, long_running: bool = False, observe: str = ""):
         """装饰器写法：把函数注册成动作。"""
 
         def wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -163,6 +215,7 @@ class Registry:
                 name=name, description=description, params=list(params or []),
                 handler=fn, danger=danger, category=category, returns=returns,
                 aliases=list(aliases or []), mutates=mutates, long_running=long_running,
+                observe=observe,
             ))
             return fn
 

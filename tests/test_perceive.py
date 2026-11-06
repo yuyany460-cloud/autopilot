@@ -176,3 +176,105 @@ def test_long_element_name_truncated_in_label() -> None:
                  class_name="", rect=Rect(0, 0, 10, 10), patterns=["Invoke"])
     assert len(el.label) < len(el.name)
     assert "..." in el.label
+
+
+def test_observe_runs_the_three_collectors_concurrently(monkeypatch) -> None:
+    """UIA / OCR / 存图 必须并行。
+
+    串行时一次观察 = 457 + 754 + 102 ≈ 1.28 秒，全花在"等子进程和等磁盘"上。
+    并行后约等于最慢的那一路。这里把三路都换成 sleep(0.3)：
+    并行应当 ≈0.3s，串行会到 0.9s。
+    """
+    import time
+
+    from autopilot import perceive
+
+    def slow_uia(*a, **k):
+        time.sleep(0.3)
+        return [], None, False, None
+
+    def slow_ocr(*a, **k):
+        time.sleep(0.3)
+        return "", [], None
+
+    def slow_shot(*a, **k):
+        time.sleep(0.3)
+        return None, None
+
+    monkeypatch.setattr(perceive, "_collect_uia", slow_uia)
+    monkeypatch.setattr(perceive, "_collect_ocr", slow_ocr)
+    monkeypatch.setattr(perceive, "_save_shot", slow_shot)
+
+    started = time.perf_counter()
+    perceive.observe(include_uia=True, include_ocr=True, save_image=True)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.75, f"三段串行要 0.9s，实际 {elapsed:.2f}s——没有并行"
+
+
+# --------------------------------------------------------------------------
+# 自适应 OCR
+#
+# 系统 OCR 一步 ~0.75 秒，但对**自绘界面**（游戏、UU加速器）它是唯一的信息
+# 来源，不能一刀切关掉。所以按"上次看这个程序时 UIA 给了多少元素"来定：
+# UIA 已经讲清楚界面的程序就跳过 OCR，读不出元素的程序照跑。
+# --------------------------------------------------------------------------
+
+
+def _fake_fg(process: str):
+    from autopilot import windows
+
+    return windows.WindowInfo(hwnd=1, title="测试窗口", class_name="Fake",
+                              pid=1, rect=Rect(0, 0, 800, 600), process=process)
+
+
+def _patch_perceive(monkeypatch, n_elements: int):
+    from autopilot import perceive, windows
+
+    monkeypatch.setattr(windows, "get_foreground", lambda: _fake_fg("testapp.exe"))
+    monkeypatch.setattr(perceive, "_collect_uia", lambda *a, **k: (
+        [Element(index=i, name=f"按钮{i}", control_type="Button", class_name="",
+                 rect=Rect(0, i * 10, 80, 20)) for i in range(1, n_elements + 1)],
+        None, False, None))
+    ran: list[int] = []
+    monkeypatch.setattr(perceive, "_collect_ocr",
+                        lambda *a, **k: (ran.append(1), ("", [], None))[1])
+    return perceive, ran
+
+
+def test_ocr_runs_the_first_time_we_see_a_program(monkeypatch) -> None:
+    """没见过的程序必须先跑 OCR——它可能就是自绘界面。"""
+    perceive, ran = _patch_perceive(monkeypatch, n_elements=20)
+    perceive.reset_ocr_history()
+    perceive.observe(include_uia=True, include_ocr=True)
+    assert ran, "第一次见到一个程序就跑不得 OCR，否则自绘界面会什么都看不到"
+    assert perceive.known_uia_rich("testapp.exe") == 20, "要记下它的元素数供下次判断"
+
+
+def test_ocr_is_skipped_once_uia_proved_rich(monkeypatch) -> None:
+    perceive, ran = _patch_perceive(monkeypatch, n_elements=20)
+    perceive.reset_ocr_history()
+    perceive.observe(include_uia=True, include_ocr=True)   # 第一次：认识它
+    ran.clear()
+    snap = perceive.observe(include_uia=True, include_ocr=True)
+    assert not ran, "UIA 已经能讲清界面，不该再花 0.75 秒做 OCR"
+    assert any("跳过 OCR" in n for n in snap.notes), "要让模型知道这次没有屏幕文字"
+
+
+def test_ocr_keeps_running_for_self_drawn_windows(monkeypatch) -> None:
+    """UIA 读不出元素的自绘界面，OCR 一次都不能省。"""
+    perceive, ran = _patch_perceive(monkeypatch, n_elements=3)
+    perceive.reset_ocr_history()
+    for _ in range(3):
+        perceive.observe(include_uia=True, include_ocr=True)
+    assert len(ran) == 3, "自绘界面必须每次都跑 OCR"
+    assert perceive.known_uia_rich("testapp.exe") == 0
+
+
+def test_adaptive_can_be_turned_off(monkeypatch) -> None:
+    """显式要"读屏幕上的字"时（get_screen_text / 控制台 OCR 开关），不能被跳过。"""
+    perceive, ran = _patch_perceive(monkeypatch, n_elements=20)
+    perceive.reset_ocr_history()
+    perceive.observe(include_uia=True, include_ocr=True)   # 让它记住
+    ran.clear()
+    perceive.observe(include_uia=True, include_ocr=True, adaptive_ocr=False)
+    assert ran, "关闭自适应后必须照跑 OCR"

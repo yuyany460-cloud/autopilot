@@ -18,7 +18,9 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -317,11 +319,141 @@ def _build_elements(raw: Sequence[dict[str, Any]]) -> tuple[list[Element], bool]
     return unique, len(parsed) > len(unique)
 
 
+# --------------------------------------------------------------------------
+# 自适应 OCR
+#
+# 一次系统 OCR 要 ~0.75 秒，比整个 UIA 元素树（~0.45 秒）还贵。但它只在一种
+# 情况下不可替代：**界面读不出结构的时候**（游戏、UU加速器这类自绘界面，
+# UIA 一个元素都拿不到，OCR 是唯一的信息来源）。
+#
+# 难点在于：要不要 OCR 必须在跑 UIA **之前**定下来，否则两者就退化成串行，
+# 读不出元素的应用（最需要 OCR 的那类）反而更慢——实测串行 1239ms，
+# 并行只要 801ms。
+#
+# 所以这里按**程序**记一笔历史：上次看这个进程时 UIA 给了多少元素。
+#   · 见过的、元素丰富的程序  → 直接跳过 OCR，一步只要 ~0.46s
+#   · 没见过 / 元素稀少的程序 → 照跑 OCR，和 UIA 并行，最坏也就是 ~0.80s
+# 切换程序时第一次按"需要 OCR"处理，宁可慢一次也不漏信息。
+# --------------------------------------------------------------------------
+
+OCR_SKIP_MIN_ELEMENTS = 12
+
+_uia_history: dict[str, int] = {}
+_uia_history_lock = threading.Lock()
+
+
+def known_uia_rich(process: str) -> int:
+    """这个程序上次的 UIA 元素数；够丰富就返回那个数，否则返回 0。
+
+    返回数而不是布尔，是为了能把它写进 notes 里说明"为什么跳过了 OCR"。
+    """
+    key = (process or "").strip().lower()
+    if not key:
+        return 0
+    with _uia_history_lock:
+        count = _uia_history.get(key, 0)
+    return count if count >= OCR_SKIP_MIN_ELEMENTS else 0
+
+
+def _remember_uia(process: str, count: int) -> None:
+    """记下这个程序这次 UIA 给了多少元素，供下次决定要不要跑 OCR。"""
+    key = (process or "").strip().lower()
+    if not key:
+        return
+    with _uia_history_lock:
+        _uia_history[key] = int(count)
+
+
+def reset_ocr_history() -> None:
+    """清掉历史（测试用）。"""
+    with _uia_history_lock:
+        _uia_history.clear()
+
+
+# --------------------------------------------------------------------------
+# 下面三个采集器互不依赖，observe() 会并行跑它们。
+#
+# 实测一次完整观察 1284ms，拆开是：
+#     UIA 457ms + 系统 OCR 754ms + 截图落盘 102ms（截屏本身只要 16ms）
+# 三段都是"起一个进程 / 写一次磁盘"的活，串着做纯属浪费。
+# 并行之后约等于最慢的那一路，实测 ~800ms。
+#
+# 线程安全：UIA 和 OCR 各自是独立的 PowerShell 进程，不共享 COM 单元；
+# 临时文件名带唯一后缀，不会互相覆盖。
+# --------------------------------------------------------------------------
+
+
+def _collect_uia(fg: Any, max_depth: int, max_elements: int):
+    """取 UI Automation 元素树。返回 ``(elements, focused, truncated, note)``。"""
+    try:
+        res = psbridge.bridge().uia_tree(
+            fg.hwnd if fg else 0, max_depth=max_depth, max_nodes=max_elements)
+    except Exception as exc:
+        return [], None, False, f"UIA 异常：{exc}"
+    if not res.get("ok"):
+        return [], None, False, f"UIA 失败：{res.get('error')}"
+    elements, _ = _build_elements(res.get("elements") or [])
+    truncated = bool(res.get("truncated"))
+    return (elements, res.get("focused"), truncated,
+            "元素过多已截断，可用 find_element 精确定位" if truncated else None)
+
+
+def _collect_ocr(image: Any, fg: Any, region: str, lang: str | None):
+    """截出 OCR 区域 → 缩放 → 落盘 → 调系统 OCR。返回 ``(text, lines, note)``。"""
+    import tempfile
+
+    try:
+        if region == "window" and fg and fg.rect.width > 40 and fg.rect.height > 40:
+            win_rect = winapi.Rect(max(0, fg.rect.left), max(0, fg.rect.top),
+                                   min(image.width, fg.rect.right),
+                                   min(image.height, fg.rect.bottom))
+            sub = screen.capture(win_rect) if (win_rect.width > 40 and win_rect.height > 40) \
+                else image
+        else:
+            sub = image
+        # 缩一下再 OCR：更快，且系统 OCR 对过大图反而更差
+        sub = sub.scaled(2200, 1400)
+        tmp = (Path(tempfile.gettempdir()) / "autopilot-ps"
+               / f"ocr-input-{time.perf_counter_ns()}.png")
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        sub.save(tmp)
+        res = psbridge.bridge().ocr(tmp, lang=lang)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    except Exception as exc:
+        return "", [], f"OCR 异常：{exc}"
+    if not res.get("ok"):
+        return "", [], f"OCR 失败：{res.get('error')}"
+
+    lines: list[OcrLine] = []
+    for item in (res.get("lines") or []):
+        r = item.get("rect") or [0, 0, 0, 0]
+        lines.append(OcrLine(
+            normalize_ocr_text(item.get("text") or ""),
+            winapi.Rect(int(r[0]), int(r[1]), int(r[0]) + int(r[2]), int(r[1]) + int(r[3])),
+        ))
+    return normalize_ocr_text(res.get("text") or ""), lines, None
+
+
+def _save_shot(image: Any, shot_dir: str | Path | None, fmt: str):
+    """把整屏截图落盘。返回 ``(path, note)``。"""
+    try:
+        base = Path(shot_dir) if shot_dir else Path("var/shots")
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"shot-{int(time.time() * 1000)}.{fmt}"
+        image.save(path, quality=75)
+        return path, None
+    except Exception as exc:
+        return None, f"保存截图失败：{exc}"
+
+
 def observe(include_uia: bool = True, include_ocr: bool = True,
             save_image: bool = True, shot_dir: str | Path | None = None,
             ocr_region: str = "window", max_elements: int = 400,
             max_depth: int = 12, ocr_lang: str | None = None,
-            image_format: str = "png") -> Snapshot:
+            image_format: str = "png", adaptive_ocr: bool = True) -> Snapshot:
     """采集一次完整的电脑状态。
 
     参数：
@@ -330,6 +462,8 @@ def observe(include_uia: bool = True, include_ocr: bool = True,
         save_image:    是否把截图落盘（Agent 每步都存，便于事后复盘）
         ocr_region:    ``"window"`` 只识别前台窗口，``"screen"`` 识别整屏
         max_elements:  UIA 最多收集多少元素
+        adaptive_ocr:  UIA 元素已经够多时跳过 OCR（省 ~0.75 秒）。
+                       显式要"读屏幕上的字"的场景（get_screen_text）应传 False。
     """
     t0 = time.perf_counter()
     winapi.enable_dpi_awareness()
@@ -350,72 +484,50 @@ def observe(include_uia: bool = True, include_ocr: bool = True,
     elements: list[Element] = []
     focused: dict[str, Any] | None = None
     truncated = False
-    if include_uia:
-        try:
-            res = psbridge.bridge().uia_tree(
-                fg.hwnd if fg else 0, max_depth=max_depth, max_nodes=max_elements)
-            if res.get("ok"):
-                elements, _ = _build_elements(res.get("elements") or [])
-                focused = res.get("focused")
-                truncated = bool(res.get("truncated"))
-                if truncated:
-                    notes.append("元素过多已截断，可用 find_element 精确定位")
-            else:
-                notes.append(f"UIA 失败：{res.get('error')}")
-        except Exception as exc:
-            notes.append(f"UIA 异常：{exc}")
-
     image = None
     image_path: Path | None = None
     ocr_text = ""
     ocr_lines: list[OcrLine] = []
+
     if include_ocr or save_image:
         try:
             image = screen.capture()
         except Exception as exc:
             notes.append(f"截屏失败：{exc}")
 
-    if image is not None and save_image:
-        try:
-            base = Path(shot_dir) if shot_dir else Path("var/shots")
-            base.mkdir(parents=True, exist_ok=True)
-            image_path = base / f"shot-{int(time.time() * 1000)}.{image_format}"
-            image.save(image_path, quality=75)
-        except Exception as exc:
-            notes.append(f"保存截图失败：{exc}")
+    # 要不要 OCR 必须在跑 UIA 之前定下来，否则两者退化成串行；
+    # 依据是**上次**看这个程序时 UIA 给了多少元素（见文件上方说明）。
+    proc = fg.process if fg else ""
+    remembered = known_uia_rich(proc) if adaptive_ocr else 0
+    want_ocr = include_ocr and image is not None
+    if want_ocr and remembered:
+        want_ocr = False
+        notes.append(f"上次看「{proc}」有 {remembered} 个元素，这次跳过 OCR"
+                     f"（自适应，省约 0.75s）")
 
-    if image is not None and include_ocr:
-        try:
-            if ocr_region == "window" and fg and fg.rect.width > 40 and fg.rect.height > 40:
-                win_rect = winapi.Rect(max(0, fg.rect.left), max(0, fg.rect.top),
-                                       min(image.width, fg.rect.right),
-                                       min(image.height, fg.rect.bottom))
-                if win_rect.width > 40 and win_rect.height > 40:
-                    sub = screen.capture(win_rect)
-                else:
-                    sub = image
-            else:
-                sub = image
-            # 缩一下再 OCR：更快，且系统 OCR 对过大图反而更差
-            sub = sub.scaled(2200, 1400)
-            import tempfile
-            tmp = Path(tempfile.gettempdir()) / "autopilot-ps" / "ocr-input.png"
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            sub.save(tmp)
-            res = psbridge.bridge().ocr(tmp, lang=ocr_lang)
-            if res.get("ok"):
-                ocr_text = normalize_ocr_text(res.get("text") or "")
-                for item in (res.get("lines") or []):
-                    r = item.get("rect") or [0, 0, 0, 0]
-                    ocr_lines.append(OcrLine(
-                        normalize_ocr_text(item.get("text") or ""),
-                        winapi.Rect(int(r[0]), int(r[1]), int(r[0]) + int(r[2]),
-                                    int(r[1]) + int(r[3])),
-                    ))
-            else:
-                notes.append(f"OCR 失败：{res.get('error')}")
-        except Exception as exc:
-            notes.append(f"OCR 异常：{exc}")
+    # 三路并行。截屏本身很快（16ms），先做完再分发。
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        jobs: dict[str, Any] = {}
+        if include_uia:
+            jobs["uia"] = pool.submit(_collect_uia, fg, max_depth, max_elements)
+        if want_ocr:
+            jobs["ocr"] = pool.submit(_collect_ocr, image, fg, ocr_region, ocr_lang)
+        if image is not None and save_image:
+            jobs["shot"] = pool.submit(_save_shot, image, shot_dir, image_format)
+
+        if "uia" in jobs:
+            elements, focused, truncated, note = jobs["uia"].result()
+            if note:
+                notes.append(note)
+            _remember_uia(proc, len(elements))
+        if "shot" in jobs:
+            image_path, note = jobs["shot"].result()
+            if note:
+                notes.append(note)
+        if "ocr" in jobs:
+            ocr_text, ocr_lines, note = jobs["ocr"].result()
+            if note:
+                notes.append(note)
 
     return Snapshot(
         ts=time.time(),

@@ -18,6 +18,7 @@ import json
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,7 @@ class Hub:
     def __init__(self, workspace: Path, allow_danger: bool = False) -> None:
         self.workspace = Path(workspace)
         self.policy = Policy(mode="auto", allow_danger=allow_danger,
-                             max_steps=40, workspace=self.workspace)
+                             max_steps=100, workspace=self.workspace)
         self.ctx: ActionContext = make_context(
             policy=self.policy, workspace=self.workspace,
             log=self._log, hotkey="ctrl+alt+q")
@@ -58,6 +59,14 @@ class Hub:
         self.agent_thread: threading.Thread | None = None
         self.last_run: AgentRun | None = None
         self.started_at = time.time()
+        # 动作**必须**在这个固定线程上跑，两条理由：
+        #   1. Playwright 的同步 API 在 asyncio 事件循环线程里会直接报
+        #      "It looks like you are using Playwright Sync API inside the asyncio loop"，
+        #      于是控制台里所有 browser_* 动作全废；
+        #   2. Playwright 对象只能在创建它的那个线程里用，所以不能交给
+        #      默认线程池（每次可能换一个线程），必须是唯一的一条线程。
+        # 附带好处：动作天然串行，不会两个动作抢鼠标。
+        self.action_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autopilot-action")
 
     # -- 日志 ------------------------------------------------------------
     def _log(self, level: str, message: str) -> None:
@@ -118,7 +127,7 @@ class Hub:
         }
 
     # -- Agent -----------------------------------------------------------
-    def start_agent(self, goal: str, max_steps: int = 30,
+    def start_agent(self, goal: str, max_steps: int = 100,
                     allow_danger: bool | None = None,
                     fast: bool = True) -> bool:
         if self.agent_running:
@@ -194,7 +203,10 @@ class Hub:
 
     def observe_text(self, include_ocr: bool = True, max_elements: int = 60) -> str:
         snap = perceive.observe(include_uia=True, include_ocr=include_ocr,
-                               save_image=False, ocr_region="window")
+                               save_image=False, ocr_region="window",
+                               # 控制台上有明确的"OCR"开关，用户勾了就该真跑，
+                               # 这里不做自适应跳过
+                               adaptive_ocr=False)
         self.ctx.set_snapshot(snap)
         return snap.render(max_elements=max_elements)
 
@@ -277,7 +289,9 @@ def create_app(workspace: Path, allow_danger: bool = False):
         params = body.get("params") or {}
         if not isinstance(params, dict):
             raise HTTPException(status_code=400, detail="params 必须是对象")
-        return JSONResponse(hub.run_action(name, params))
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(hub.action_pool, hub.run_action, name, params)
+        return JSONResponse(result)
 
     @app.post("/api/agent/start")
     async def api_agent_start(request: Request) -> Any:
@@ -288,7 +302,7 @@ def create_app(workspace: Path, allow_danger: bool = False):
         allow = body.get("allow_danger")
         ok = hub.start_agent(
             goal,
-            max_steps=int(body.get("max_steps") or 30),
+            max_steps=int(body.get("max_steps") or 100),
             allow_danger=None if allow is None else bool(allow),
             fast=bool(body.get("fast", True)),
         )

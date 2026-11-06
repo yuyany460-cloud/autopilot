@@ -703,6 +703,38 @@ def get_window_rect(hwnd: int) -> Rect:
     return Rect(int(r.left), int(r.top), int(r.right), int(r.bottom))
 
 
+def client_origin(hwnd: int) -> tuple[int, int]:
+    """窗口**客户区左上角**在屏幕上的物理像素坐标。
+
+    网页的视口原点就是它——`getBoundingClientRect()` 给的是视口坐标，
+    加上这个原点就是屏幕坐标，可以直接拿去截屏裁剪。
+    """
+    _require_windows()
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", w.LONG), ("y", w.LONG)]
+
+    pt = POINT(0, 0)
+    if not _user32.ClientToScreen(ctypes.c_void_p(int(hwnd)), ctypes.byref(pt)):
+        return (0, 0)
+    return (int(pt.x), int(pt.y))
+
+
+def get_client_rect(hwnd: int) -> Rect:
+    """客户区在**屏幕**上的矩形（物理像素）。"""
+    _require_windows()
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", w.LONG), ("top", w.LONG),
+                    ("right", w.LONG), ("bottom", w.LONG)]
+
+    r = RECT()
+    if not _user32.GetClientRect(ctypes.c_void_p(int(hwnd)), ctypes.byref(r)):
+        return Rect(0, 0, 0, 0)
+    ox, oy = client_origin(hwnd)
+    return Rect(ox, oy, ox + int(r.right), oy + int(r.bottom))
+
+
 def get_window_pid(hwnd: int) -> int:
     _require_windows()
     pid = w.DWORD(0)

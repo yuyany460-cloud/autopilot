@@ -114,7 +114,7 @@
         <div class="row" style="margin-top:9px">
           <div style="flex:0 0 130px">
             <label>最多步数</label>
-            <input type="number" id="max-steps" value="25" min="1" max="200">
+            <input type="number" id="max-steps" value="100" min="1" max="300">
           </div>
           <div style="flex:0 0 auto;padding-top:16px">
             <label style="margin:0"><input type="checkbox" id="fast" checked
@@ -267,6 +267,10 @@ function handleEvent(e){
   else if(k === 'stopped'){ addLog(`<span class="k-stopped">⏹ ${esc(e.reason)}</span>`); }
   else if(k === 'error'){ addLog(`<span class="k-error">⚠ ${esc(e.message)}</span>`); }
   else if(k === 'narration'){ addLog(`<span class="k-log">（模型未给出动作）${esc(e.text).slice(0,300)}</span>`); }
+  else if(k === 'blind'){ addLog(`<span class="k-stopped">👁 连续 ${e.count} 步读不到界面元素，已提醒模型改用键盘/换入口</span>`); }
+  else if(k === 'circuit_break'){
+    addLog(`<span class="bad">🚫 已拦下重复/盲点动作 <b>${esc(e.name)}</b>（第 ${e.count} 次）</span>`);
+  }
   else if(k === 'flow_start'){ addLog(`<span class="k-llm">▶ 流程开始：${esc(e.name)}</span>`); }
   else if(k === 'flow_step'){
     const r = e.result||{};

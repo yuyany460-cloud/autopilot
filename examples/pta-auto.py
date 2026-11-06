@@ -8,7 +8,7 @@
 
 用法（在项目根目录下执行）::
 
-    python examples/pta-auto.py --dump          # 导出题目到 var/pta/
+    python examples/pta-auto.py --dump          # 导出题目到 var/pta/（含图片公式）
     #   → 打开 var/pta/questions.txt 看题，把答案填进 var/pta/answers.json
     python examples/pta-auto.py --fill          # 把答案填进页面（不提交）
     python examples/pta-auto.py --submit --yes  # 确认无误后再提交
@@ -41,10 +41,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from autopilot import quizkit, quizread
 from autopilot.actions import _browser_exe, _cdp_ready          # noqa: E402
 
 PROFILE = ROOT / "var" / "browser-profile"
 OUT_DIR = ROOT / "var" / "pta"
+IMG_DIR = OUT_DIR / "images"
 CDP = "http://127.0.0.1:9222"
 DEFAULT_URL = ("https://pintia.cn/problem-sets/2102237619822460928"
                "/exam/problems/type/2")
@@ -59,79 +61,6 @@ DEFAULT_URL = ("https://pintia.cn/problem-sets/2102237619822460928"
 #
 #   所以一切以 "按 radio 的 name 分组" 为锚点，比猜 CSS 类名可靠得多。
 # --------------------------------------------------------------------------
-
-DUMP_JS = r"""
-() => {
-  const txt = e => (e && (e.innerText || e.textContent) || '').trim();
-  const numId = e => e && e.id && /^\d+$/.test(e.id) ? e.id : null;
-
-  const optionText = r => {
-    let t = '';
-    if (r.id) {
-      const l = document.querySelector(`label[for="${CSS.escape(r.id)}"]`);
-      if (l) t = txt(l);
-    }
-    if (!t && r.closest('label')) t = txt(r.closest('label'));
-    if (!t) t = txt(r.parentElement);
-    return t.replace(/\s+/g, ' ').slice(0, 300);
-  };
-
-  const problems = [];
-
-  // ---- 单选题：按 radio 分组 ----
-  const radios = Array.from(document.querySelectorAll('input[type=radio]'));
-  const groups = {};
-  radios.forEach(r => { (groups[r.name] = groups[r.name] || []).push(r); });
-  for (const name of Object.keys(groups)) {
-    const rs = groups[name];
-    let box = rs[0];
-    while (box && !numId(box)) box = box.parentElement;
-    const full = box ? txt(box) : '';
-    problems.push({
-      label: (full.match(/^(\d+-\d+)/) || [, ''])[1],
-      id: name,
-      kind: 'choice',
-      head: full.slice(0, 260).replace(/\s+/g, ' '),
-      options: rs.map((r, i) => ({index: i, text: optionText(r), id: r.id || ''})),
-    });
-  }
-
-  // ---- 编程题：带数字 id 且挂了编辑器的容器 ----
-  const editorSel = '.monaco-editor, .CodeMirror, textarea, [contenteditable=true]';
-  const seen = new Set(problems.map(p => p.id));
-  Array.from(document.querySelectorAll('div[id]')).forEach(box => {
-    const id = numId(box);
-    if (!id || seen.has(id)) return;
-    if (!box.querySelector(editorSel)) return;
-    const full = txt(box);
-    seen.add(id);
-    problems.push({
-      label: (full.match(/^(\d+-\d+)/) || [, ''])[1],
-      id,
-      kind: 'program',
-      head: full.slice(0, 260).replace(/\s+/g, ' '),
-      editors: {
-        monaco: box.querySelectorAll('.monaco-editor').length,
-        codemirror: box.querySelectorAll('.CodeMirror').length,
-        textarea: box.querySelectorAll('textarea').length,
-        contenteditable: box.querySelectorAll('[contenteditable=true]').length,
-      },
-    });
-  });
-
-  // 按题号排序，读起来顺
-  problems.sort((a, b) => a.label.localeCompare(b.label, 'zh', {numeric: true}));
-
-  return {
-    url: location.href,
-    title: document.title,
-    count: problems.length,
-    problems,
-    pageButtons: Array.from(document.querySelectorAll('button'))
-                      .map(txt).filter(Boolean).slice(0, 40),
-  };
-}
-"""
 
 FILL_JS = r"""
 (payload) => {
@@ -361,14 +290,29 @@ def is_program_page(page) -> bool:
         " && !!%s" % CODE_EDITOR_FIND)
 
 
-def goto_problem(page, href: str, settle: int = 2500) -> None:
+def goto_problem(page, href: str, settle: int = 600, timeout: int = 8000) -> None:
     """按 href 直接导航到某道题。
 
     最早是模拟点击题号，但 SPA 的切换时序很不稳定（实测点了 1~9 都停在原题），
     而这些 ``<a>`` 本来就带 href，直接 goto 又准又快。
+
+    翻页等待从"固定 sleep 2.5 秒"改成"等正文和编辑器出现"：条件通常
+    0.4~0.8 秒就满足（10 道题省 15 秒以上），而真慢的时候它会一直等到
+    ``timeout``，比死等 2.5 秒然后对着半张页面抓题更稳。
     """
     url = href if href.startswith("http") else "https://pintia.cn" + href
     page.goto(url, wait_until="domcontentloaded", timeout=90000)
+    try:
+        page.wait_for_function(
+            """() => {
+                const body = document.body ? (document.body.innerText || '') : '';
+                if (body.length < 200) return false;
+                return !!document.querySelector(
+                    '.cm-content, .monaco-editor, .CodeMirror, textarea, [contenteditable=true]');
+            }""",
+            timeout=timeout)
+    except Exception:
+        pass          # 条件没满足也继续：宁可抓到半页，也别直接报错退出
     page.wait_for_timeout(settle)
 
 
@@ -469,28 +413,35 @@ def wait_for_login(page, url: str, timeout: float = 300.0) -> None:
 # --------------------------------------------------------------------------
 
 
+def _render_questions_txt(data: dict) -> str:
+    """人看的题目清单：**全文题干**（含公式识别结果），不截断。"""
+    lines = [f"# {data.get('title')}", f"# {data.get('url')}",
+             f"# 共 {data.get('count')} 题", ""]
+    for p in data.get("problems") or []:
+        lines.append(f"## {p.get('label')}  [{p.get('kind')}]  (id={p.get('id')})")
+        body = quizread.compose_problem(p, budget=6000) if p.get("blocks") else (p.get("text") or "")
+        lines.append(body)
+        for i, sample in enumerate(p.get("samples") or [], 1):
+            lines.append(f"   样例{i} 输入: {sample.get('in')!r}")
+            lines.append(f"   样例{i} 输出: {sample.get('out')!r}")
+        lines.append("")
+    buttons = data.get("pageButtons") or []
+    if buttons:
+        lines.append("页面级按钮: " + ", ".join(buttons))
+    return "\n".join(lines)
+
+
 def cmd_dump(page, args) -> int:
     # 编程题是单题视图，结构跟单选题页完全不同，先分流
     if is_program_page(page):
         return dump_program(page, args)
 
-    print("抓取题目…")
-    data = page.evaluate(DUMP_JS)
+    print("抓取题目（题干全文 + 图片公式）…")
+    data = quizread.read_page(page, IMG_DIR, workspace=ROOT, jobs=args.jobs,
+                              prompt=args.read_prompt)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "questions.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    lines = [f"# {data['title']}", f"# {data['url']}", f"# 共 {data['count']} 题", ""]
-    for p in data["problems"]:
-        lines.append(f"## {p['label']}   [{p['kind']}]  (id={p['id']})")
-        lines.append(f"   {p['head'][:300]}")
-        for o in p.get("options", []):
-            lines.append(f"     [{o['index']}] {o['text']}")
-        if p.get("editors"):
-            lines.append(f"     编辑器: {p['editors']}")
-        lines.append("")
-    lines.append("页面级按钮: " + ", ".join(data["pageButtons"]))
-    (OUT_DIR / "questions.txt").write_text("\n".join(lines), encoding="utf-8")
+    write_json(OUT_DIR / "questions.json", data)
+    (OUT_DIR / "questions.txt").write_text(_render_questions_txt(data), encoding="utf-8")
 
     ans_file = OUT_DIR / "answers.json"
     if not ans_file.exists():
@@ -510,14 +461,25 @@ def cmd_dump(page, args) -> int:
         print("  （用记事本编辑没问题，带 BOM 也读得进来）")
 
     print(f"\n共 {data['count']} 题，已导出到 {OUT_DIR}")
-    print("  questions.txt   （人看的）")
-    print("  questions.json  （机器读的）")
-    print("  answers.json    ← 把答案填这里")
+    print(f"  读题结果：{quizread.summarize(data)}")
+    for failure in (data.get("stats") or {}).get("failures") or []:
+        print(f"  ⚠ 图片读取失败：{failure}")
+    print("  questions.txt   （人看的，题干是全文）")
+    print("  questions.json  （机器读的，含图片识别结果）")
+    print("  answers.json    ← 把答案填这里，或跑 --solve")
     print("\n题目概览：")
     for p in data["problems"]:
-        n = len(p.get("options", []))
-        print(f"  {p['label']:6} {p['kind']:8} {'选项 '+str(n) if n else '编辑器'}  "
-              f"{p['head'][:64]}")
+        n = len(p.get("options") or [])
+        flags = []
+        if p.get("images"):
+            flags.append(f"图{p['images']}")
+        unread = sum(1 for o in (p.get("options") or [])
+                     for img in (o.get("imgs") or []) if not img.get("text"))
+        if unread:
+            flags.append(f"未读图{unread}")
+        print(f"  {p['label']:6} {p['kind']:8} "
+              f"{'选项 ' + str(n) if n else '编辑器'}  {' '.join(flags):10} "
+              f"{(p.get('text') or '').replace(chr(10), ' ')[:56]}")
     return 0
 
 
@@ -542,7 +504,15 @@ def write_json(path: Path, data) -> None:
 
 
 def dump_program(page, args) -> int:
-    """编程题页一次只显示一道题，按 href 逐题翻。"""
+    """编程题页一次只显示一道题，按 href 逐题翻。
+
+    每题做两件事：① 用 ``quizread`` 抽题干（含**公式图片**，程序题的数学
+    表达式也常是图片）；② 用 ``READ_JS`` 抽样例输入输出（那部分在只读
+    CodeMirror 里，DOM 结构比正文可靠）。
+
+    原有的固定 ``sleep(2.5s)`` 换成了"等编辑器/正文出现"的条件等待：
+    条件一般 0.4~0.8 秒就满足，10 道题能省 15 秒以上，且比死等更稳。
+    """
     navs = nav_items(page)
     if not navs:
         print("找不到题号导航，无法逐题抓取。")
@@ -552,28 +522,42 @@ def dump_program(page, args) -> int:
     problems = []
     for item in navs:
         goto_problem(page, item["href"])
-        info = page.evaluate(READ_JS)
-        info["index"] = item["n"]
-        info["kind"] = "program"
-        info["href"] = item["href"]
-        problems.append(info)
-        print(f"  {info.get('label') or item['n']:8} "
-              f"{info.get('name', '')[:42]}  样例 {len(info.get('samples') or [])} 组")
+        try:
+            info = page.evaluate(READ_JS) or {}
+        except Exception:
+            info = {}
+        extracted = quizread.extract(page)
+        candidates = extracted.get("problems") or []
+        if candidates:
+            problem = candidates[0]
+            for other in candidates[1:]:
+                if other.get("label") == (info.get("label") or ""):
+                    problem = other
+                    break
+        else:
+            problem = {"kind": "program", "blocks": [{"kind": "text",
+                                                      "text": info.get("text") or ""}],
+                       "options": [], "images": 0}
+        problem["label"] = info.get("label") or problem.get("label") or str(item["n"])
+        problem["name"] = info.get("name") or ""
+        problem["kind"] = "program"
+        problem["samples"] = info.get("samples") or []
+        problem["href"] = item["href"]
+        problems.append(problem)
+        print(f"  {problem.get('label') or item['n']:8} "
+              f"{problem.get('name', '')[:40]}  样例 {len(problem['samples'])} 组"
+              f"  图 {problem.get('images') or 0}")
 
+    # 图片落地 + 视觉识别：按题批量提交、多题并行
+    prepared = quizread.prepare_images(page, problems, IMG_DIR, workspace=ROOT)
+    vision_stats = quizread.read_problem_images(problems, workspace=ROOT, jobs=args.jobs,
+                                                prompt=args.read_prompt)
     data = {"url": page.url, "title": page.title(), "count": len(problems),
-            "problems": problems, "pageButtons": []}
+            "problems": problems, "pageButtons": [],
+            "stats": {**prepared, **vision_stats}}
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     write_json(OUT_DIR / "questions.json", data)
-
-    lines = [f"# {data['title']}", f"# {data['url']}", f"# 共 {data['count']} 题", ""]
-    for p in problems:
-        lines.append(f"## {p.get('label')}  {p.get('name', '')}")
-        lines.append(p.get("text", ""))
-        for i, s in enumerate(p.get("samples") or [], 1):
-            lines.append(f"   样例{i} 输入: {s['in']!r}")
-            lines.append(f"   样例{i} 输出: {s['out']!r}")
-        lines.append("")
-    (OUT_DIR / "questions.txt").write_text("\n".join(lines), encoding="utf-8")
+    (OUT_DIR / "questions.txt").write_text(_render_questions_txt(data), encoding="utf-8")
 
     ans_file = OUT_DIR / "answers.json"
     if not ans_file.exists() or args.force:
@@ -583,6 +567,9 @@ def dump_program(page, args) -> int:
                         for p in problems],
         })
     print(f"\n已导出到 {OUT_DIR}")
+    print(f"  读题结果：{quizread.summarize(data)}")
+    for failure in (data.get("stats") or {}).get("failures") or []:
+        print(f"  ⚠ {failure}")
     print("  下一步：python examples/pta-auto.py --solve")
     return 0
 
@@ -596,7 +583,11 @@ PROGRAM_SOLVE_SYSTEM = """你是 C 语言程序设计助教。用户会给你若
 - 程序必须完整、可直接编译运行（含 #include <stdio.h> 和 int main）。
 - 严格遵守题目的输入格式与输出格式，**输出格式一个空格都不能差**（很多题会因为这个判错）。
 - 用 double 处理实数，按题目要求控制小数位数。
-- 代码放在 code 字段里，用 \\n 表示换行。"""
+- 代码放在 code 字段里，用 \\n 表示换行。
+
+题面里的数学公式已经被转成普通文本（√ 表示根号、^ 表示乘方、/ 表示分数），
+形状为〔图N: …〕的片段是题面中的图片被识别后的内容，属于题目的一部分。
+样例输入/输出是**权威**：它们比题面的文字描述更能决定程序的真实行为。"""
 
 
 def build_program_prompt(data: dict) -> str:
@@ -611,15 +602,248 @@ def build_program_prompt(data: dict) -> str:
     return "\n".join(lines)
 
 
+WRITE_API_JS = r"""
+(code) => {
+  const isRO = e => ((e.parentElement && e.parentElement.className) || '').includes('readOnly');
+  const visible = e => e && e.offsetParent !== null;
+
+  // ① Monaco：直接改 model，不经过任何输入事件（粘贴拦截对它无效）
+  try {
+    if (window.monaco && window.monaco.editor) {
+      const eds = Array.from(document.querySelectorAll('.monaco-editor')).filter(e => !isRO(e));
+      const models = window.monaco.editor.getModels();
+      if (eds.length && models.length) {
+        const idx = eds.findIndex(visible);
+        const model = models[Math.max(0, idx) % models.length] || models[0];
+        model.setValue(code);
+        return {ok: true, via: 'monaco.setValue'};
+      }
+    }
+  } catch (e) {}
+
+  // ② CodeMirror 6：走 EditorView.dispatch（内部 API，取不到就交给下一档）
+  try {
+    const cs = Array.from(document.querySelectorAll('.cm-content')).filter(e => !isRO(e));
+    const c = cs.find(visible) || cs[0];
+    if (c) {
+      const cmv = c.cmView || (c.parentElement && c.parentElement.cmView);
+      const view = cmv && (cmv.view || (cmv.rootView && cmv.rootView.view));
+      if (view && view.dispatch && view.state && view.state.doc) {
+        view.dispatch({changes: {from: 0, to: view.state.doc.length, insert: code}});
+        return {ok: true, via: 'cm6.dispatch'};
+      }
+    }
+  } catch (e) {}
+
+  // ③ CodeMirror 5
+  try {
+    const el = Array.from(document.querySelectorAll('.CodeMirror')).filter(e => !isRO(e))[0];
+    if (el && el.CodeMirror) {
+      el.CodeMirror.setValue(code);
+      return {ok: true, via: 'cm5.setValue'};
+    }
+  } catch (e) {}
+
+  // ④ 原生 textarea：用原型 setter + input 事件，绕过 React 受控组件
+  try {
+    const tas = Array.from(document.querySelectorAll('textarea')).filter(t => !isRO(t));
+    const ta = tas.find(visible) || tas[0];
+    if (ta) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(ta, code);
+      ta.dispatchEvent(new Event('input', {bubbles: true}));
+      ta.dispatchEvent(new Event('change', {bubbles: true}));
+      return {ok: true, via: 'textarea.setter'};
+    }
+  } catch (e) {}
+
+  return {ok: false, via: '', why: '取不到编辑器 API（Monaco / CM6 / CM5 / textarea 都没有）'};
+}
+"""
+
+# 读回校验用：不假设是哪一种编辑器，按优先级找"当前可见的那个"
+EDITOR_READ_JS = r"""
+() => {
+  const isRO = e => ((e.parentElement && e.parentElement.className) || '').includes('readOnly');
+  const visible = e => e && e.offsetParent !== null;
+
+  const cs = Array.from(document.querySelectorAll('.cm-content')).filter(e => !isRO(e));
+  const c = cs.find(visible) || cs[0];
+  if (c) return c.innerText || '';
+
+  try {
+    if (window.monaco && window.monaco.editor) {
+      const models = window.monaco.editor.getModels();
+      if (models.length) return models[0].getValue();
+    }
+  } catch (e) {}
+
+  const tas = Array.from(document.querySelectorAll('textarea')).filter(t => !isRO(t));
+  const ta = tas.find(visible) || tas[0];
+  if (ta) return ta.value || '';
+
+  const ces = Array.from(document.querySelectorAll('[contenteditable=true]'));
+  const ce = ces.find(visible) || ces[0];
+  if (!ce) return '';
+  // 纯 contenteditable 里，<br> 和块级子元素（<div>/<p>）都代表换行。
+  // 直接取 innerText 常把多行粘成一行（实测 "int main(){   return 0; }"），
+  // 于是读回校验永远判"不一致"——用户看到的就是"明明写进去了却报失败"。
+  const walkCE = node => {
+    let out = '';
+    (node.childNodes || []).forEach(n => {
+      if (n.nodeType === 3) { out += n.nodeValue; return; }
+      if (n.nodeName === 'BR') { out += '\n'; return; }
+      if (n.nodeType !== 1) return;
+      const block = /^(DIV|P|PRE|LI|TR)$/.test(n.tagName);
+      if (block && out && !out.endsWith('\n')) out += '\n';
+      out += walkCE(n);
+      if (block) out += '\n';
+    });
+    return out;
+  };
+  return walkCE(ce);
+}
+"""
+
+
 def _same_code(a: str, b: str) -> bool:
-    """比较编辑器内容与目标代码。
+    """比较编辑器内容与目标代码（逐行，忽略空行与行尾空白）。
 
     不能直接比字符串：CodeMirror 的 ``insertText`` 会偶尔多插一个空行
     （实测 188 字符写进去变 189）。对编译毫无影响，所以忽略空行差异。
+
+    另一个坑：contenteditable 会把**连续空格变成 NBSP**（``\u00a0``），
+    于是缩进 4 空格读回来是 ``\xa0\xa0``——不归一化就会"明明写对了判失败"。
     """
     def norm(s: str) -> list[str]:
-        return [ln.rstrip() for ln in (s or "").strip().splitlines() if ln.strip()]
+        text = (s or "").replace("\u00a0", " ").replace("\r\n", "\n")
+        return [ln.rstrip() for ln in text.strip().splitlines() if ln.strip()]
     return norm(a) == norm(b)
+
+
+def _same_code_loose(a: str, b: str) -> bool:
+    """忽略**全部空白**比较：只判断"内容有没有丢"，不判断换行/缩进表示。
+
+    只在严格比较失败后作为兜底：某些编辑器（纯 contenteditable）拿不到可靠的
+    换行结构，但字符内容是对的。命中这一档会在结果里注明，让人知道"排版以
+    编辑器为准"。
+    """
+    squeeze = lambda s: re.sub(r"\s+", "", (s or "").replace("\u00a0", " "))
+    target = squeeze(b)
+    return bool(target) and squeeze(a) == target
+
+
+WRITE_METHODS = ("api", "insert", "exec", "type")
+
+# 写入失败时的建议（真的遇到"禁止粘贴"的页面时，这段话比错误码有用）
+WRITE_TIPS = """\
+      这页很可能禁用了程序化写入（粘贴 / beforeinput 被拦，或者检测了事件来源）。
+      可以按顺序试：
+        1) --write-method type --typing-delay 10   逐键输入，最像真人（慢一点）
+        2) apilot do browser_type text="..." method=type   走 agent 的键盘通道
+        3) 仍然不行就手动粘贴/输入这一题，再跑 --submit --yes"""
+
+
+def _editor_locator(page):
+    return page.locator(".cm-content, .monaco-editor, .CodeMirror, textarea, "
+                        "[contenteditable=true]").first
+
+
+def _focus_editor(page) -> None:
+    """点一下编辑器，确保后续键盘事件落到正确位置。"""
+    try:
+        _editor_locator(page).click(timeout=8000)
+        page.wait_for_timeout(150)
+    except Exception:
+        pass
+
+
+def _clear_editor(page) -> None:
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Delete")
+    page.wait_for_timeout(120)
+
+
+def _read_editor(page) -> str:
+    try:
+        return str(page.evaluate(EDITOR_READ_JS) or "")
+    except Exception:
+        return ""
+
+
+def write_code(page, code: str, method: str = "auto", delay_ms: int = 0) -> dict:
+    """把代码写进当前题目的编辑器，**每次写入都读回校验**，不通过就升级手段。
+
+    为什么要阶梯：PTA 这类考试页会主动拦截粘贴（有的连 ``beforeinput`` 一起拦），
+    单纯 execCommand / insertText 会出现"看起来写了、其实没写"。
+    从"最不可能被拦"到"最像真人"依次尝试：
+
+    ====== ============================================================
+    api    Monaco ``model.setValue`` / CM6 ``view.dispatch`` / CM5 / textarea
+           原型 setter —— **完全不产生输入事件**，粘贴拦截对它无效
+    insert CDP ``Input.insertText`` —— 浏览器级文本插入，不是 paste 事件
+    exec   ``document.execCommand('insertText')`` —— 历史路径，兼容性最好
+    type   逐键输入 —— 最慢，但连"检测输入来源"的站点也拦不住
+    ====== ============================================================
+
+    返回 ``{"ok", "via", "tried": [(手段, 是否成功)], "detail"}``。
+    """
+    requested = str(method or "auto")
+    order = WRITE_METHODS if requested == "auto" else (requested,)
+    tried: list[tuple[str, bool]] = []
+
+    if requested == "auto":
+        _focus_editor(page)
+
+    for name in order:
+        detail = ""
+        try:
+            if name == "api":
+                out = page.evaluate(WRITE_API_JS, code) or {}
+                detail = str(out.get("why") or "")
+                if not out.get("ok"):
+                    tried.append((name, False))
+                    continue
+            elif name == "insert":
+                _focus_editor(page)
+                _clear_editor(page)
+                page.keyboard.insert_text(code)
+                page.wait_for_timeout(250)
+            elif name == "exec":
+                _focus_editor(page)
+                page.evaluate(WRITE_JS, code)
+                page.wait_for_timeout(250)
+            elif name == "type":
+                _focus_editor(page)
+                _clear_editor(page)
+                page.keyboard.type(code, delay=max(0, int(delay_ms)))
+                page.wait_for_timeout(250)
+            else:
+                raise ValueError(f"未知的写入方式：{name}")
+        except Exception as exc:      # 这一档炸了就换下一档，不中断整题
+            tried.append((name, False))
+            detail = f"{type(exc).__name__}: {exc}"[:120]
+            continue
+
+        # 读回校验：给编辑器两次机会（有的框架下一帧才同步）
+        back = _read_editor(page)
+        if not _same_code(back, code):
+            page.wait_for_timeout(350)
+            back = _read_editor(page)
+        ok = _same_code(back, code)
+        loose = False
+        if not ok and _same_code_loose(back, code):
+            ok, loose = True, True
+        tried.append((name, ok))
+        if ok:
+            if loose:
+                detail = "内容一致，但换行/缩进以编辑器显示为准（读回无法逐行比对）"
+            return {"ok": True, "via": name, "tried": tried, "detail": detail}
+        preview = (back or "").strip().replace("\n", " ")[:60]
+        detail = f"读回不一致（编辑器里是 {preview!r}）"
+
+    return {"ok": False, "via": "", "tried": tried,
+            "detail": detail or "所有写入通道都没有生效"}
 
 
 def _find_gcc() -> str:
@@ -727,15 +951,19 @@ def cmd_verify(args) -> int:
     return 0
 
 
-def fill_program(page, answers: list[dict], dry: bool) -> int:
+def fill_program(page, answers: list[dict], args) -> int:
     """逐题翻页 + 写代码。不提交。"""
+    dry = bool(getattr(args, "dry_run", False))
+    method = str(getattr(args, "write_method", "auto") or "auto")
+    delay_ms = int(getattr(args, "typing_delay", 0) or 0)
     by_label = {str(a.get("label")): a for a in answers}
     navs = nav_items(page)
     if not navs:
         print("找不到题号导航。")
         return 1
 
-    print(f"{'演练（不写）' if dry else '写入'} {len(navs)} 道编程题…")
+    print(f"{'演练（不写）' if dry else '写入'} {len(navs)} 道编程题…"
+          f"{'' if dry else f'（写入方式：{method}）'}")
     wrote = 0
     failed = []
     for item in navs:
@@ -751,19 +979,17 @@ def fill_program(page, answers: list[dict], dry: bool) -> int:
                   f"（{info.get('name', '')[:30]}）")
             wrote += 1
             continue
-        res = page.evaluate(WRITE_JS, code_item["code"])
-        if not res.get("ok"):
-            print(f"  ✗ {label}: {res.get('why')}")
-            failed.append(label)
+        out = write_code(page, code_item["code"], method=method, delay_ms=delay_ms)
+        if out["ok"]:
+            chain = "/".join(f"{name}{'✓' if ok else '✗'}" for name, ok in out["tried"])
+            print(f"  ✓ {label:8} {info.get('name', '')[:26]:28}"
+                  f" {len(code_item['code']):>4} 字符  读回一致"
+                  f"（{out['via']}；尝试 {chain or '-'}）")
+            wrote += 1
             continue
-        page.wait_for_timeout(500)
-        back = page.evaluate(READ_CODE_JS) or ""
-        ok = _same_code(back, code_item["code"])
-        print(f"  {'✓' if ok else '✗'} {label:8} {info.get('name', '')[:26]:28}"
-              f" {len(code_item['code']):>4} 字符{'  读回一致' if ok else '  读回不一致'}")
-        wrote += 1 if ok else 0
-        if not ok:
-            failed.append(label)
+        print(f"  ✗ {label:8} {info.get('name', '')[:26]:28} 写入失败：{out['detail']}")
+        print(WRITE_TIPS)
+        failed.append(label)
 
     print(f"\n完成 {wrote}/{len(navs)} 题。**没有提交**。")
     if failed:
@@ -784,23 +1010,122 @@ def fill_program(page, answers: list[dict], dry: bool) -> int:
 SOLVE_SYSTEM = """你是 C 语言考试答题助手。用户会给你若干道单选题，你只需要给出答案。
 
 严格只输出一个 JSON 对象，不要任何解释性文字、不要 markdown 代码块，格式：
-{"answers": [{"label": "题号", "index": 选项序号(从0开始), "reason": "一句话理由"}]}
+{"answers": [{"label": "题号", "letter": "B", "index": 1, "reason": "一句话理由"}]}
+
+**letter 和 index 必须指向同一个选项**：index 从 0 开始（A=0、B=1、C=2、D=3）。
+两个都写出来，程序会交叉校验；只写一个也能跑，但写两个能少一类"错一位"的事故。
 
 注意 C 语言的常见陷阱：运算符优先级、赋值 vs 相等（= 与 ==）、
 短路求值、if-else 配对、switch 穿透、自增自减的前后缀、整数除法。
-如果题目里的代码有语法错误导致无法运行，如实选择对应选项。"""
+如果题目里的代码有语法错误导致无法运行，如实选择对应选项。
+
+题干里的数学公式已经被转成普通文本（√ 表示根号、^ 表示乘方、/ 表示分数），
+形状为〔图N: …〕的片段是题面里的图片被识别后的内容，请当作题面的一部分。
+看不清的地方（写了 [?]）不要猜，按最合理的理解作答并在 reason 里说明。"""
 
 
-def build_solve_prompt(data: dict) -> str:
-    lines = [f"共 {data['count']} 道单选题，请逐题作答。", ""]
-    for p in data["problems"]:
-        if p.get("kind") != "choice" or not p.get("options"):
-            continue
-        lines.append(f"【{p['label']}】{p['head']}")
-        for o in p["options"]:
-            lines.append(f"  [{o['index']}] {o['text']}")
+def _problem_text(problem: dict, budget: int = 2000) -> str:
+    """一题的完整文本：题干全文（含公式识别结果）+ 选项。
+
+    早期实现只给 ``head``（前 260 字符）——长题的关键条件全被切掉，
+    那才是答错的主要原因，比模型的推理能力影响大得多。
+    """
+    if problem.get("blocks"):
+        return quizread.compose_problem(problem, budget=budget)
+    return str(problem.get("head") or problem.get("text") or "")[:budget]
+
+
+def build_solve_prompt(data: dict, budget: int = 2000) -> str:
+    problems = [p for p in data["problems"]
+                if p.get("kind") == "choice" and p.get("options")]
+    lines = [f"共 {len(problems)} 道单选题，请逐题作答。", ""]
+    for p in problems:
+        lines.append(f"【{p['label']}】")
+        lines.append(_problem_text(p, budget))
         lines.append("")
     return "\n".join(lines)
+
+
+def build_program_prompt(data: dict, budget: int = 2600) -> str:
+    lines = [f"共 {data['count']} 道编程题。", ""]
+    for p in data["problems"]:
+        lines.append(f"【{p.get('label')}】{p.get('name', '')}")
+        lines.append(_problem_text(p, budget))
+        for i, sample in enumerate(p.get("samples") or [], 1):
+            lines.append(f"样例{i} 输入：{sample.get('in')}")
+            lines.append(f"样例{i} 输出：{sample.get('out')}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# 答案规范化：把模型的各种写法落成确定的选项下标
+# --------------------------------------------------------------------------
+
+
+def _pick_index(item: dict, count: int) -> tuple[int | None, str]:
+    """从模型的一条答案里取选项下标：**字母优先**，再与 index 交叉校验。
+
+    为什么字母优先：``A/B/C`` 没有"0 还是 1 起始"的歧义，而纯数字有。
+    提示词里已经要求两个都写、并且 index 从 0 开始；这一层是防止模型不听话——
+    两者指向不同选项时按字母取，并把分歧写进告警（而不是默默采信一个）。
+    """
+    letter = item.get("letter", item.get("answer_letter"))
+    raw = item.get("index", item.get("answer", item.get("choice")))
+
+    by_letter: int | None = None
+    letter_note = ""
+    if letter not in (None, ""):
+        by_letter, letter_note = quizkit.normalize_index(letter, count)
+
+    by_index: int | None = None
+    index_note = ""
+    if raw not in (None, ""):
+        by_index, index_note = quizkit.normalize_index(raw, count)
+
+    if by_letter is None:
+        return by_index, index_note or letter_note
+    if by_index is not None and by_index != by_letter:
+        return by_letter, (f"letter={letter!r} 与 index={raw!r} 指向不同选项，"
+                           f"按 letter 取 {by_letter}")
+    return by_letter, ""
+
+
+def normalize_answers(raw_answers: list[dict], problems: list[dict]
+                      ) -> tuple[list[dict], list[str]]:
+    """把模型返回的答案变成 ``answers.json`` 的结构，并收集需要人看的告警。
+
+    模型对"第几个选项"的写法五花八门（``0``/``1``/``A``/``（B）``/整段文字），
+    这里统一解析；解析不出来时**保留 None 并告警**，绝不瞎填一个下标——
+    填错一位的代价是整题错，而留空至少能让人一眼看出来。
+    """
+    by_label = {str(p.get("label")): p for p in problems}
+    out: list[dict] = []
+    warnings: list[str] = []
+    for item in raw_answers or []:
+        label = str(item.get("label", "")).strip()
+        problem = by_label.get(label)
+        if problem is None:
+            warnings.append(f"模型给了不存在的题号 {label!r}，已忽略")
+            continue
+        if problem.get("kind") == "program" or item.get("type") == "program":
+            code = str(item.get("code") or item.get("answer") or "")
+            out.append({"label": label, "type": "program", "code": code})
+            continue
+        options = problem.get("options") or []
+        index, note = _pick_index(item, len(options))
+        if index is None and item.get("text"):
+            index, note = quizkit.match_option(options, item.get("text"))
+        if index is None:
+            warnings.append(f"{label}: {note or '答案无法解析'}")
+        elif note:
+            warnings.append(f"{label}: {note}")
+        record = {"label": label, "type": "choice", "index": index,
+                  "reason": str(item.get("reason") or "")[:200]}
+        if isinstance(index, int):
+            record["letter"] = chr(ord("A") + index)   # 方便人眼核对，--fill 不读它
+        out.append(record)
+    return out, warnings
 
 
 def parse_solve_output(text: str) -> list[dict]:
@@ -819,6 +1144,113 @@ def parse_solve_output(text: str) -> list[dict]:
     return answers
 
 
+REVIEW_SYSTEM = """你是一位严谨的阅卷老师，正在**独立复核**一批 C 语言单选题。
+
+必须严格按下面的顺序，不要跳步：
+1. 先完全独立地把每道题解一遍（不要看"待复核答案"那一段的内容），
+   把关键推理写在心里：运算符优先级、赋值 vs 相等、短路求值、
+   if-else 配对、switch 穿透、前后缀自增、整数除法、字符串结尾 '\\0' 等。
+2. 得出你自己认为正确的选项：写出选项字母（A/B/C/D）和下标（**从 0 开始**，A=0）。
+3. 再和"待复核答案"逐题对比，标出是否一致。
+
+严格只输出一个 JSON 对象，不要解释性文字、不要 markdown 代码块，格式：
+{"answers": [{"label": "题号", "letter": "B", "index": 1, "agree": true/false, "note": "不一致时一句话说明对方错在哪"}]}"""
+
+
+def _make_client(model: str = "", temperature: float = 0.0, max_tokens: int = 4096,
+                 extra: dict | None = None):
+    from autopilot.llm import (LLMClient, LLMConfig, resolve_api_key, resolve_base_url,
+                               resolve_model)
+
+    cfg = LLMConfig(
+        model=model or resolve_model(ROOT),
+        base_url=resolve_base_url(ROOT),
+        api_key=resolve_api_key(ROOT),
+        temperature=temperature,
+        max_tokens=max_tokens,
+        extra_body=dict(extra or {}),
+    ).resolved()
+    return cfg, LLMClient(cfg, workspace=ROOT)
+
+
+def _chat_with_retry(cfg, messages: list[dict], max_tokens: int = 4096,
+                     temperature: float = 0.0):
+    """发一轮对话；**内容为空时关掉思考模式重试一次**。
+
+    实测坑：deepseek 系列默认开思考，思维链按 completion token 计费。
+    ``max_tokens`` 给小了（比如单题 1024）会出现"推理把额度吃光、``content``
+    返回空字符串"，上层看到的就是「模型没有返回 JSON：（空）」——
+    一次任务白跑。关掉思考重发几乎必定拿到答案。
+    """
+    import dataclasses
+
+    from autopilot.llm import LLMClient
+
+    response = LLMClient(cfg, workspace=ROOT).chat(
+        messages, temperature=temperature, max_tokens=max_tokens)
+    if (response.content or "").strip():
+        return response
+    retry_cfg = dataclasses.replace(
+        cfg, extra_body={**(cfg.extra_body or {}), "thinking": {"type": "disabled"}})
+    return LLMClient(retry_cfg, workspace=ROOT).chat(
+        messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def review_choice_answers(data: dict, answers: list[dict], model: str = "") -> tuple[dict, int]:
+    """让更强的模型**先独立重做**一遍，再和初答对比。一次调用解决整卷。
+
+    为什么先独立做、再对比：反过来问"这个答案对吗"，它会顺着你说"对"，
+    复核就白做了（``autopilot.llm.review`` 里踩过这个坑，这里是批量版）。
+
+    返回 ``({label: index}, 未命中题数)``；调用失败时返回空字典，不阻塞流程。
+    """
+    from autopilot.llm import REVIEW_MODEL
+
+    targets = [a for a in answers
+               if a.get("type") == "choice" and isinstance(a.get("index"), int)]
+    if not targets:
+        return {}, 0
+    mine = "\n".join(f"  {a['label']}: [{a['index']}]" for a in targets)
+    prompt = (build_solve_prompt(data, budget=2000)
+              + "\n\n# 待复核答案（第 3 步之前不要看它）\n" + mine)
+
+    messages = [{"role": "system", "content": REVIEW_SYSTEM},
+                {"role": "user", "content": prompt}]
+    try:
+        cfg, client = _make_client(model or REVIEW_MODEL, max_tokens=8000,
+                                   extra={"reasoning_effort": "low"})
+        try:
+            resp = _chat_with_retry(cfg, messages, max_tokens=8000)
+        except Exception as exc:
+            # 拿不到更强的模型就退回默认模型：复核弱一点，总比不复核强
+            print(f"  复核模型不可用（{str(exc)[:80]}），退回默认模型")
+            cfg, client = _make_client(model, max_tokens=8000)
+            resp = _chat_with_retry(cfg, messages, max_tokens=8000)
+    except Exception as exc:
+        print(f"  ⚠ 复核失败：{str(exc)[:120]}")
+        return {}, len(targets)
+
+    print(f"  复核用模型：{cfg.model}，输入 {(resp.usage or {}).get('prompt_tokens', 0)}"
+          f" / 输出 {(resp.usage or {}).get('completion_tokens', 0)} tokens")
+    try:
+        raw = parse_solve_output(resp.content)
+    except Exception as exc:
+        print(f"  ⚠ 复核结果解析失败：{exc}")
+        return {}, len(targets)
+
+    reviewed = {}
+    for item in raw:
+        label = str(item.get("label", "")).strip()
+        problem = next((p for p in data["problems"] if str(p.get("label")) == label), None)
+        if problem is None:
+            continue
+        index, _ = _pick_index(item, len(problem.get("options") or []))
+        if index is not None:
+            reviewed[label] = index
+    missing = len([a for a in targets if a["label"] not in reviewed])
+    return reviewed, missing
+
+
 def cmd_solve(args) -> int:
     qfile = OUT_DIR / "questions.json"
     if not qfile.is_file():
@@ -834,26 +1266,20 @@ def cmd_solve(args) -> int:
         print("导出的题目里没有可作答的题。")
         return 2
 
-    from autopilot.llm import LLMClient, LLMConfig, resolve_api_key, resolve_base_url, resolve_model
-
-    cfg = LLMConfig(
-        model=args.model or resolve_model(ROOT),
-        base_url=resolve_base_url(ROOT),
-        api_key=resolve_api_key(ROOT),
-        temperature=0.0,
-    ).resolved()
-    client = LLMClient(cfg, workspace=ROOT)
+    cfg, client = _make_client(args.model, temperature=0.0)
+    if not cfg.api_key:
+        print("没有配置 API 密钥，无法 --solve。见 README 的「配置模型」。")
+        return 2
 
     answers: list[dict] = []
     total_in = total_out = 0
 
     # 一次调用解决所有题目；编程题代码量大，给更宽的 max_tokens
     if choice_todo:
-        print(f"把 {len(choice_todo)} 道单选题发给 {cfg.model}（一次调用）…")
-        resp = client.chat(
-            [{"role": "system", "content": SOLVE_SYSTEM},
-             {"role": "user", "content": build_solve_prompt(data)}],
-            temperature=0.0, max_tokens=4096)
+        print(f"把 {len(choice_todo)} 道单选题发给 {cfg.model}（一次调用，题干全文）…")
+        resp = _chat_with_retry(cfg, [
+            {"role": "system", "content": SOLVE_SYSTEM},
+            {"role": "user", "content": build_solve_prompt(data)}], max_tokens=4096)
         total_in += (resp.usage or {}).get("prompt_tokens", 0)
         total_out += (resp.usage or {}).get("completion_tokens", 0)
         try:
@@ -866,10 +1292,9 @@ def cmd_solve(args) -> int:
 
     if program_todo:
         print(f"把 {len(program_todo)} 道编程题发给 {cfg.model}（一次调用，代码量大）…")
-        resp = client.chat(
-            [{"role": "system", "content": PROGRAM_SOLVE_SYSTEM},
-             {"role": "user", "content": build_program_prompt(data)}],
-            temperature=0.0, max_tokens=16000)
+        resp = _chat_with_retry(cfg, [
+            {"role": "system", "content": PROGRAM_SOLVE_SYSTEM},
+            {"role": "user", "content": build_program_prompt(data)}], max_tokens=16000)
         total_in += (resp.usage or {}).get("prompt_tokens", 0)
         total_out += (resp.usage or {}).get("completion_tokens", 0)
         try:
@@ -877,41 +1302,69 @@ def cmd_solve(args) -> int:
         except Exception as exc:
             print(f"编程题解析失败：{exc}\n{resp.content[:600]}")
             return 1
-        for a in prog:
-            a["type"] = "program"
+        for item in prog:
+            item["type"] = "program"
         answers += prog
         print(f"  {len(prog)} 题，输入 {(resp.usage or {}).get('prompt_tokens', 0)} "
               f"/ 输出 {(resp.usage or {}).get('completion_tokens', 0)} tokens")
 
     print(f"合计：输入 {total_in} / 输出 {total_out} tokens")
 
-    by_label = {p["label"]: p for p in data["problems"]}
-    out = []
-    print("\n模型给出的答案（**请自己复核**）：")
-    for a in answers:
-        label = str(a.get("label", ""))
-        src = by_label.get(label)
-        if a.get("type") == "program":
-            code = str(a.get("code", ""))
+    out, warnings = normalize_answers(answers, data["problems"])
+    for warning in warnings:
+        print(f"  ⚠ {warning}")
+
+    # 批量复核：只对选择题做（编程题有 --verify 的编译校验，那个更靠得住）
+    if getattr(args, "check", True) and any(a["type"] == "choice" for a in out):
+        print("\n独立复核（用更强的模型重做一遍再对比，一次调用）…")
+        reviewed, missing = review_choice_answers(data, out, args.check_model)
+        if reviewed:
+            conflicts = 0
+            for answer in out:
+                if answer["type"] != "choice":
+                    continue
+                checked = reviewed.get(answer["label"])
+                if checked is None:
+                    continue
+                answer["checked"] = checked
+                if checked != answer.get("index"):
+                    answer["conflict"] = True
+                    conflicts += 1
+            print(f"  复核完成：{len(reviewed)} 题一致，⚠ {conflicts} 题有分歧"
+                  f"（写上 checked 字段，--fill 默认采用复核答案）")
+        if missing:
+            print(f"  ⚠ 有 {missing} 题没能复核（模型漏答）")
+
+    by_label = {str(p["label"]): p for p in data["problems"]}
+    print("\n最终答案：")
+    for answer in out:
+        label = answer["label"]
+        problem = by_label.get(label) or {}
+        if answer["type"] == "program":
+            code = str(answer.get("code", ""))
             first = code.strip().splitlines()[0] if code.strip() else "(空)"
             print(f"  {label:8} [代码 {len(code):>4} 字符] {first[:60]}")
-            out.append({"label": label, "type": "program", "code": code})
             continue
-        idx = a.get("index")
-        picked = ""
-        if src and isinstance(idx, int) and 0 <= idx < len(src.get("options", [])):
-            picked = src["options"][idx]["text"]
-        print(f"  {label:8} [{idx}] {picked[:70]}")
-        print(f"           理由：{str(a.get('reason', ''))[:100]}")
-        if src is not None:
-            out.append({"label": label, "type": "choice", "index": idx})
+        options = problem.get("options") or []
+        index = answer.get("index")
+        picked = options[index]["text"] if isinstance(index, int) and 0 <= index < len(options) else "(未确定)"
+        mark = "⚠" if answer.get("conflict") else " "
+        print(f" {mark}{label:8} [{index}] {str(picked)[:66]}")
+        if answer.get("reason"):
+            print(f"           理由：{answer['reason'][:100]}")
+        if answer.get("conflict"):
+            checked = answer.get("checked")
+            other = options[checked]["text"] if isinstance(checked, int) and 0 <= checked < len(options) else "?"
+            print(f"           ⚠ 复核认为应选 [{checked}] {str(other)[:60]}")
 
     # 补全模型漏掉的题，保持文件结构完整
     got = {a["label"] for a in out}
-    for p in data["problems"]:
-        if p["label"] not in got:
-            out.append({"label": p["label"], "type": p.get("kind", "choice"),
-                        **({"code": ""} if p.get("kind") == "program" else {"index": None})})
+    for problem in data["problems"]:
+        label = str(problem.get("label"))
+        if label not in got:
+            out.append({"label": label, "type": problem.get("kind", "choice"),
+                        **({"code": ""} if problem.get("kind") == "program"
+                           else {"index": None})})
 
     ans_file = Path(args.answers) if args.answers else OUT_DIR / "answers.json"
     if ans_file.is_file() and not args.force:
@@ -919,7 +1372,8 @@ def cmd_solve(args) -> int:
         backup.write_text(ans_file.read_text(encoding="utf-8-sig"), encoding="utf-8")
         print(f"\n已备份原答案文件到 {backup.name}")
     write_json(ans_file, {
-        "_说明": "由 --solve 生成，请复核后再 --fill；想手改就直接改 index/text/code",
+        "_说明": "由 --solve 生成；conflict=true 表示复核有分歧，"
+                 "checked 是复核答案。想手改就直接改 index/text/code",
         "answers": out,
     })
     print(f"\n已写入 {ans_file}")
@@ -945,12 +1399,33 @@ def cmd_fill(page, args) -> int:
         if not programs:
             print(f"{ans_file} 里没有可写入的编程题代码（code 字段都是空的）。")
             return 2
-        return fill_program(page, answers, dry=bool(args.dry_run))
+        return fill_program(page, answers, args)
 
-    choices = [a for a in answers
-               if a.get("type") == "choice"
-               and (a.get("index") is not None or a.get("text"))]
+    choices = []
+    conflicts = []
+    undefined = []
+    trust = str(getattr(args, "trust", "check") or "check")
+    for answer in answers:
+        if answer.get("type") != "choice":
+            continue
+        index = answer.get("index")
+        checked = answer.get("checked")
+        # 复核有分歧的题：默认采用**复核答案**（更强模型独立重做的那一份）
+        if answer.get("conflict") and isinstance(checked, int):
+            conflicts.append((answer.get("label"), index, checked))
+            if trust == "check":
+                index = checked
+        if index is None and not answer.get("text"):
+            undefined.append(answer.get("label"))
+            continue
+        choices.append({**answer, "index": index})
     programs = [a for a in answers if a.get("type") == "program" and a.get("code")]
+
+    for label, first, checked in conflicts:
+        print(f"  ⚠ {label}: 初答 [{first}] 与复核 [{checked}] 不一致，"
+              f"按 --trust={trust} 采用 [{checked if trust == 'check' else first}]")
+    if undefined:
+        print(f"  ⚠ 这些题没有确定的答案，已跳过：{undefined}")
 
     if not choices and not programs:
         print(f"{ans_file} 里还没填任何答案（index / text / code 都是空的）。")
@@ -1022,6 +1497,23 @@ def main() -> int:
                     help="本地编译并跑样例，提前发现错误（需要 gcc）")
     ap.add_argument("--gcc", default="", help="指定 C 编译器路径")
     ap.add_argument("--model", default="", help="配合 --solve 指定模型")
+    ap.add_argument("--jobs", type=int, default=4,
+                    help="读图并发数（一题一次视觉调用，默认 4）")
+    ap.add_argument("--write-method", choices=["auto", *WRITE_METHODS], default="auto",
+                    help="代码写入方式：auto 逐级降级（默认）/ api 框架API / "
+                         "insert CDP插入 / exec execCommand / type 逐键")
+    ap.add_argument("--typing-delay", type=int, default=0,
+                    help="配合 --write-method type：每个字符之间的毫秒数（被判定输入过快时调大）")
+    ap.add_argument("--read-prompt", default="",
+                    help="覆盖读图时给视觉模型的额外要求")
+    ap.add_argument("--check", dest="check", action="store_true", default=True,
+                    help="--solve 后额外做一次独立复核（默认开启，一次调用）")
+    ap.add_argument("--no-check", dest="check", action="store_false",
+                    help="关闭独立复核，省一次调用")
+    ap.add_argument("--check-model", default="",
+                    help="复核用的模型（默认更強的 REVIEW_MODEL）")
+    ap.add_argument("--trust", choices=["check", "first"], default="check",
+                    help="复核有分歧时以哪份答案为准（默认 check）")
     ap.add_argument("--force", action="store_true", help="覆盖已有答案文件时不备份")
     args = ap.parse_args()
 

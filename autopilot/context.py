@@ -72,5 +72,15 @@ def make_context(policy: Policy | None = None, workspace: str | Path | None = No
     ks = KillSwitch(stop_file=ws / "var" / "STOP", hotkey=hotkey)
     if start_hotkey:
         ks.start()
+    # 先把扩展桥的监听挂上，这样浏览器里的扩展能在这条命令用到浏览器之前就接上来。
+    # 端口被占用（另一个 AutoPilot 在跑）时只是连不上，不影响其它功能。
+    try:
+        from . import extbridge
+
+        b = extbridge.bridge()
+        if not b.status()["listening"]:
+            (log or (lambda level, msg: None))("info", f"扩展桥未监听：{b.last_error}")
+    except Exception:
+        pass
     return ActionContext(guard=Guard(pol), killswitch=ks, workspace=ws,
                          log=log or (lambda level, msg: None), confirm=confirm)

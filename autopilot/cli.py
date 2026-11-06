@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,84 @@ def _c(text: str, color: str = "", enabled: bool = True) -> str:
     return f"{C[color]}{text}{C['reset']}"
 
 
+# ANSI 颜色转义（日志文件里要去掉，否则记事本打开全是 [36m）
+_ANSI = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+
+class _Tee:
+    """把 stdout 复制一份写进日志文件。
+
+    存在的理由很实际：cmd 窗口一滚就没了，而"刚才它到底干了什么"往往只能事后问。
+    审计日志（``audit-*.jsonl``）只记**执行过的动作**，模型的思考/工具返回/报错
+    都在屏幕上——那些恰恰是排查"为什么不动了"最需要的。
+    """
+
+    def __init__(self, stream: Any, handle: Any) -> None:
+        self._stream = stream
+        self._handle = handle
+
+    def write(self, text: str) -> int:
+        try:
+            written = self._stream.write(text)
+        except Exception:
+            written = 0
+        try:
+            # 控制台带颜色时会混进 ANSI 转义序列，写进日志文件会变成乱码
+            self._handle.write(_ANSI.sub("", text))
+        except Exception:
+            pass
+        return written if isinstance(written, int) else len(text)
+
+    def flush(self) -> None:
+        for target in (self._stream, self._handle):
+            try:
+                target.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        try:
+            return bool(self._stream.isatty())
+        except Exception:
+            return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _start_run_log(workspace: Path) -> tuple[Any, Path, Any] | None:
+    """开始把控制台输出同时写进 ``var/logs/run-YYYYMMDD.log``。
+
+    返回 ``(原 stdout, 日志路径, 文件句柄)``；任何一步失败都静默放弃——
+    日志不是主要功能，不能因为磁盘/权限问题让命令跑不起来。
+    """
+    try:
+        logs = workspace / "var" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        path = logs / f"run-{datetime.now():%Y%m%d}.log"
+        if path.is_file() and path.stat().st_size > 5 * 1024 * 1024:
+            path.replace(path.with_suffix(".1.log"))
+        handle = path.open("a", encoding="utf-8", buffering=1)
+        handle.write(f"\n{'=' * 72}\n[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+                     f"ap {' '.join(sys.argv[1:])}\n{'=' * 72}\n")
+        original = sys.stdout
+        sys.stdout = _Tee(original, handle)
+        return original, path, handle
+    except Exception:
+        return None
+
+
+def _stop_run_log(state: tuple[Any, Path, Any] | None) -> None:
+    if not state:
+        return
+    original, _path, handle = state
+    sys.stdout = original
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
 def _log(level: str, message: str) -> None:
     icons = {"info": ("·", "dim"), "warn": ("!", "yellow"),
              "error": ("×", "red"), "debug": (" ", "dim")}
@@ -89,7 +168,7 @@ def _make_policy(args: argparse.Namespace) -> Policy:
         mode=getattr(args, "mode", "auto") or "auto",
         allow_danger=bool(getattr(args, "allow_dangerous", False)),
         dry_run=bool(getattr(args, "dry_run", False)),
-        max_steps=int(getattr(args, "max_steps", 30) or 30),
+        max_steps=int(getattr(args, "max_steps", 100) or 100),
     )
 
 
@@ -111,6 +190,23 @@ def _make_executor(args: argparse.Namespace, ctx: ActionContext,
 # --------------------------------------------------------------------------
 # 子命令实现
 # --------------------------------------------------------------------------
+
+
+class UsageError(ValueError):
+    """用法问题：由 ``main`` 原样打印，不带异常前缀、也不打堆栈。
+
+    典型场景：``ap r`` 后面忘了写目标。原来会显示
+    "出错：ValueError: 没有任务目标..."，看着像程序崩了，其实只是没给参数。
+    """
+
+
+GOAL_USAGE = """用法：ap r "<一句话目标>"
+
+  ap r "打开记事本，把今天的日期写进去，保存到桌面的 note.txt"
+  ap r --goal-file task.txt      长说明写在文件里（换行、引号不会被打坏）
+  ap r @task.txt                 同上，@ 开头的文件会自动当文件读
+  ap r --dry-run "..."            先看它打算怎么做，不真的动手
+  ap r --help                     看全部参数（--max-steps / --model / --mode …）"""
 
 
 def _resolve_goal(args: argparse.Namespace) -> str:
@@ -138,13 +234,9 @@ def _resolve_goal(args: argparse.Namespace) -> str:
             raise FileNotFoundError(f"目标文件不存在：{p}")
         goal = p.read_text(encoding="utf-8").strip()
         if not goal:
-            raise ValueError(f"目标文件是空的：{p}")
+            raise UsageError(f"目标文件是空的：{p}\n\n{GOAL_USAGE}")
     if not goal:
-        raise ValueError(
-            "没有任务目标。用法：\n"
-            '  apilot run "把今天的日期写进记事本"\n'
-            "  apilot run --goal-file task.txt\n"
-            "  apilot run @task.txt")
+        raise UsageError(f"还没有给目标。\n\n{GOAL_USAGE}")
     return goal
 
 
@@ -242,7 +334,9 @@ def cmd_observe(args: argparse.Namespace) -> int:
     snap = perceive.observe(
         include_uia=not args.no_uia, include_ocr=not args.no_ocr,
         save_image=args.save, shot_dir=ctx.workspace / "var" / "shots",
-        ocr_region=args.ocr_region)
+        ocr_region=args.ocr_region,
+        # 这是给人看的调试视图，要看就一次看全，不做自适应跳过
+        adaptive_ocr=False)
     if args.json:
         print(json.dumps(snap.as_dict(), ensure_ascii=False, indent=2, default=str))
     else:
@@ -435,14 +529,24 @@ def cmd_selfcheck(args: argparse.Namespace) -> int:
 
     ctx = _make_context(args)
     print("  鼠标/键盘回环测试…")
-    before = winapi.get_cursor_pos()
-    winapi.move_to(before[0] + 37, before[1] + 21)
-    time.sleep(0.12)
-    moved = winapi.get_cursor_pos()
-    winapi.move_to(*before)
-    delta = (abs(moved[0] - before[0] - 37), abs(moved[1] - before[1] - 21))
-    report["pointer"] = {"before": list(before), "after": list(moved), "error": list(delta)}
-    print(f"  鼠标：误差 {delta} {'正常' if max(delta) <= 2 else '异常'}")
+    # 用户正在动鼠标时这个回环必然"失败"（实测能偏出 50 像素），那是环境不是故障。
+    # 所以失败先重试两次，仍然失败再报异常——别在用户正常用电脑时报假警。
+    pointer = None
+    for attempt in range(3):
+        before = winapi.get_cursor_pos()
+        winapi.move_to(before[0] + 37, before[1] + 21)
+        time.sleep(0.12)
+        moved = winapi.get_cursor_pos()
+        winapi.move_to(*before)
+        time.sleep(0.05)
+        delta = (abs(moved[0] - before[0] - 37), abs(moved[1] - before[1] - 21))
+        pointer = {"before": list(before), "after": list(moved), "error": list(delta)}
+        if max(delta) <= 2:
+            break
+    assert pointer is not None
+    report["pointer"] = pointer
+    ok = max(pointer["error"]) <= 2
+    print(f"  鼠标：误差 {tuple(pointer['error'])} {'正常' if ok else '异常（可能你正在动鼠标）'}")
 
     probe = "autopilot-selfcheck-测试"
     winapi.clipboard_set_text(probe)
@@ -615,19 +719,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
+# 子命令的短写（在 cmd 里敲 ap d screenshot 比 python -m autopilot do screenshot 快得多）
+COMMAND_ALIASES = {
+    "r": "run", "o": "observe", "d": "do", "a": "actions", "f": "flow",
+    "sc": "selfcheck", "dr": "doctor", "cfg": "config", "s": "serve",
+}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autopilot", description="AutoPilot —— Windows 全自动电脑操控框架",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="示例：\n"
-               '  python -m autopilot selfcheck\n'
-               '  python -m autopilot observe\n'
-               '  python -m autopilot do screenshot\n'
-               '  python -m autopilot run "打开记事本，写下今天的日期并保存到桌面"\n'
-               '  python -m autopilot run --goal-file task.txt\n'
-               '  python -m autopilot run @task.txt\n'
-               '  python -m autopilot flow list\n'
-               '  python -m autopilot serve\n')
+        epilog="短命令（在 cmd 里直接敲，等价于 python -m autopilot）：\n"
+               '  ap doctor                    # 子命令也可以只写首字母\n'
+               '  ap o                         # observe\n'
+               '  ap d screenshot              # do\n'
+               '  ap r "打开记事本，写下今天的日期并保存到桌面"\n'
+               '  ap r @task.txt               # 长目标从文件读\n'
+               '  ap f list                    # flow list\n'
+               '  ap s                         # serve\n'
+               '\n完整子命令：' + "、".join(COMMAND_ALIASES) + '\n')
     parser.add_argument("--version", action="version", version=f"autopilot {__version__}")
 
     common = argparse.ArgumentParser(add_help=False)
@@ -639,26 +750,31 @@ def build_parser() -> argparse.ArgumentParser:
                         help="安全模式")
     common.add_argument("--no-hotkey", action="store_true", help="不注册全局急停热键")
     common.add_argument("--hotkey", default="ctrl+alt+q", help="急停热键组合")
+    common.add_argument("--no-log", action="store_true",
+                        help="不把控制台输出同时写进 var/logs/run-YYYYMMDD.log")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_run = sub.add_parser("run", parents=[common], help="让 Agent 自主完成目标")
+    p_run = sub.add_parser("run", aliases=["r"], parents=[common],
+                   help="让 Agent 自主完成目标")
     p_run.add_argument("goal", nargs="?", default="",
                        help="要完成的目标；多行长文本建议用 --goal-file 或 @文件")
     p_run.add_argument("--goal-file", "-f", dest="goal_file", default="",
                        help="从文件读取目标（长任务说明用这个，避免命令行转义问题）")
-    p_run.add_argument("--max-steps", type=int, default=30, help="最多多少步")
+    p_run.add_argument("--max-steps", type=int, default=100, help="最多多少步")
     p_run.add_argument("--model", help="模型名")
     p_run.add_argument("--base-url", help="API 地址")
     p_run.add_argument("--temperature", type=float, default=0.0)
     p_run.add_argument("--max-tokens", type=int, default=4096)
     p_run.add_argument("--fast", action="store_true", help="每步不做 OCR，速度更快")
-    p_run.add_argument("--vision", action="store_true", help="把截图一起发给模型（需视觉模型）")
+    p_run.add_argument("--vision", action="store_true",
+                       help="每步把截图一起发给模型（deepseek-flash 支持看图，图像约 1024 token/张）")
     p_run.add_argument("--pause", type=float, default=0.0, help="每步之间的停顿秒数")
     p_run.add_argument("--json", action="store_true", help="最后输出 JSON 结果")
     p_run.set_defaults(func=cmd_run)
 
-    p_obs = sub.add_parser("observe", parents=[common], help="打印当前屏幕快照")
+    p_obs = sub.add_parser("observe", aliases=["o"], parents=[common],
+                   help="打印当前屏幕快照")
     p_obs.add_argument("--json", action="store_true")
     p_obs.add_argument("--no-uia", action="store_true", help="跳过 UI Automation")
     p_obs.add_argument("--no-ocr", action="store_true", help="跳过 OCR")
@@ -669,19 +785,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_obs.add_argument("--max-ocr-lines", type=int, default=60)
     p_obs.set_defaults(func=cmd_observe)
 
-    p_do = sub.add_parser("do", parents=[common], help="直接执行一个动作")
+    p_do = sub.add_parser("do", aliases=["d"], parents=[common],
+                   help="直接执行一个动作")
     p_do.add_argument("action", help="动作名，如 click / screenshot / launch_app")
     p_do.add_argument("params", nargs="*", help="参数，形如 key=value")
     p_do.add_argument("--auto-observe", choices=["full", "fast", "none"], default="none")
     p_do.add_argument("--json", action="store_true")
     p_do.set_defaults(func=cmd_do)
 
-    p_act = sub.add_parser("actions", parents=[common], help="列出所有动作")
+    p_act = sub.add_parser("actions", aliases=["a"], parents=[common],
+                   help="列出所有动作")
     p_act.add_argument("--category", help="只看某一类")
     p_act.add_argument("--json", action="store_true", help="输出 function-calling schema")
     p_act.set_defaults(func=cmd_actions)
 
-    p_flow = sub.add_parser("flow", parents=[common], help="确定性流程")
+    p_flow = sub.add_parser("flow", aliases=["f"], parents=[common],
+                   help="确定性流程")
     p_flow.add_argument("flow_action", choices=["list", "run", "record"])
     p_flow.add_argument("--file", help="流程文件名或路径")
     p_flow.add_argument("--var", action="append", help="变量 key=value，可重复")
@@ -692,17 +811,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_flow.add_argument("--auto-observe", choices=["full", "fast", "none"], default="fast")
     p_flow.set_defaults(func=cmd_flow)
 
-    p_sc = sub.add_parser("selfcheck", parents=[common], help="各子系统自检")
+    p_sc = sub.add_parser("selfcheck", aliases=["sc"], parents=[common],
+                   help="各子系统自检")
     p_sc.add_argument("--json", action="store_true")
     p_sc.set_defaults(func=cmd_selfcheck)
 
-    p_doc = sub.add_parser("doctor", parents=[common], help="环境体检")
+    p_doc = sub.add_parser("doctor", aliases=["dr"], parents=[common],
+                   help="环境体检")
     p_doc.set_defaults(func=cmd_doctor)
 
-    p_cfg = sub.add_parser("config", parents=[common], help="显示当前配置")
+    p_cfg = sub.add_parser("config", aliases=["cfg"], parents=[common],
+                   help="显示当前配置")
     p_cfg.set_defaults(func=cmd_config)
 
-    p_srv = sub.add_parser("serve", parents=[common], help="启动 Web 控制台")
+    p_srv = sub.add_parser("serve", aliases=["s"], parents=[common],
+                   help="启动 Web 控制台")
     p_srv.add_argument("--host", default="127.0.0.1")
     p_srv.add_argument("--port", type=int, default=8787)
     p_srv.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
@@ -715,9 +838,23 @@ def main(argv: list[str] | None = None) -> int:
     _init_console()
     winapi.enable_dpi_awareness()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    if not tokens:
+        # 只敲一个 ap：直接给帮助，比 argparse 的 "required: command" 友好
+        parser.print_help()
+        return 2
+    args = parser.parse_args(tokens)
+    log_state = None
+    if not getattr(args, "no_log", False):
+        log_state = _start_run_log(Path(getattr(args, "workspace", None) or ROOT))
+        if log_state and getattr(args, "command", "") in {
+                "run", "r", "do", "d", "flow", "f", "observe", "o", "serve", "s"}:
+            print(_c(f"（控制台输出同时记到 {log_state[1]}，加 --no-log 可关）", "dim"))
     try:
         return int(args.func(args) or 0)
+    except UsageError as exc:
+        print(exc)
+        return 2
     except KeyboardInterrupt:
         print(_c("\n已被用户中断", "yellow"))
         return 130
@@ -727,6 +864,8 @@ def main(argv: list[str] | None = None) -> int:
             import traceback
             traceback.print_exc()
         return 1
+    finally:
+        _stop_run_log(log_state)
 
 
 if __name__ == "__main__":

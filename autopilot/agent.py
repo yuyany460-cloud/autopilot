@@ -29,17 +29,59 @@ from .perceive import Snapshot
 # 取 3 是权衡：给正常的"重试一次"留余地，又不至于让它把步数烧光。
 MAX_IDENTICAL_REPEAT = 3
 
+# 连续多少步"界面读不出任何元素"就警告 / 直接禁止点击。
+# 真实教训：UU加速器这类自绘界面没有 UIA 元素、OCR 也读不出字，
+# 模型就按坐标瞎点，37 步全部 ok 但零进展。软提示没用，必须硬拦。
+BLIND_WARN_STEPS = 4
+BLIND_BLOCK_STEPS = 8
+
+# 这些动作是"按坐标/元素点"，在瞎点状态下最该被拦住
+CLICK_ACTIONS = {"click", "double_click", "right_click", "drag", "scroll",
+                 "move_mouse", "browser_click"}
+
+# 对话历史的大小上限（按字符粗略折算，中英混排约 1.9 字符 = 1 token）。
+#
+# 为什么值得这么较真：DeepSeek 的输入计费是
+#     缓存命中 0.04 元/百万 token   vs   未命中 2 元/百万 token   （高峰时段）
+# 差 **50 倍**。也就是说 1 个未命中 token 顶 50 个命中 token。
+# 一次裁剪会瞬间让整段历史变成未命中，所以裁剪必须"攒够了再一次丢到位"。
+#
+# 取值依据（按上面单价做的优化）：设每次裁剪后上下文为 C0、每步新增 r，
+# 一个周期 K 步的总成本 ≈ 0.04·K·(C0 + Kr/2) + 2·(C0 - 9.5k)，
+# 对 K 求极小得 K = √(100·(C0-9.5k)/r)。C0 越小越省，但太小会丢掉任务上下文，
+# 所以取"预算的 30%"作为落点，实际大约每 30~40 步裁一次。
+#
+# 顺带一提：模型上下文有 1M，这里卡住不是为了不超限，纯粹是为了省钱和提速。
+CONTEXT_CHAR_BUDGET = 90_000
+CONTEXT_TRIM_TARGET = 0.30
+
+
+def _history_chars(messages: list[dict[str, Any]]) -> int:
+    """粗略估算一段对话的字符数，用来判断要不要裁剪。"""
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        total += len(content) if isinstance(content, str) else 0
+        calls = msg.get("tool_calls")
+        if calls:
+            total += len(json.dumps(calls, ensure_ascii=False))
+    return total
+
+
+def _flatten(rounds: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [msg for group in rounds for msg in group]
+
 
 @dataclass
 class AgentConfig:
     """Agent 运行参数。"""
 
     goal: str = ""
-    max_steps: int = 30
+    max_steps: int = 100
     allow_danger: bool = False
     temperature: float = 0.0
     observe_every_step: bool = True
-    include_screenshot: bool = False   # 需要视觉模型才有效
+    include_screenshot: bool = False   # 每步附上截图（deepseek-flash 支持看图）
     extra_rules: str = ""
     max_observation_chars: int = 5000
     keep_recent_observations: int = 5
@@ -135,6 +177,10 @@ class Agent:
         # 重复动作熔断用的状态（每次 run 重置）
         self._last_signature: tuple[str, str] | None = None
         self._repeat_run = 0
+        # "瞎点"计数：连续多少步界面读不出任何元素
+        self._blind_run = 0
+        if snapshot is not None and not snapshot.elements:
+            self._blind_run = 1
 
         for step in range(1, cfg.max_steps + 1):
             if self.ctx.killswitch.triggered:
@@ -143,10 +189,14 @@ class Agent:
                 break
 
             remaining = cfg.max_steps - step
+            blind = self._blind_run
+            if blind >= BLIND_WARN_STEPS:
+                self._log("warn", f"👁 连续 {blind} 步读不到界面元素，已提醒模型换打法")
+                yield self._emit("blind", step=step, count=blind)
             messages = self._trim_history(messages, cfg.keep_recent_observations)
             messages.append({"role": "user",
                              "content": prompts.build_step_hint(
-                                 step, cfg.max_steps, remaining, last_error)})
+                                 step, cfg.max_steps, remaining, last_error, blind)})
             last_error = ""
 
             # ---- 问模型 ----
@@ -218,6 +268,24 @@ class Agent:
                 self._log("warn", f"⛔ 熔断：{primary.name} 连续重复 {self._repeat_run} 次")
                 yield self._emit("circuit_break", step=step, name=primary.name,
                                  count=self._repeat_run)
+            elif blind >= BLIND_BLOCK_STEPS and primary.name in CLICK_ACTIONS:
+                # 界面连续多步读不出任何元素，还在一门心思按坐标点——直接不执行。
+                # 真实教训：UU加速器自绘界面，37 步全 ok、零进展，步数全烧在瞎点上。
+                result = ActionResult(
+                    action=primary.name, params=primary.arguments, ok=False,
+                    denied=True, reason="界面读不出元素，禁止继续盲点",
+                    error=(f"已经连续 {blind} 步读不到任何界面元素（这个窗口多半是自绘界面），"
+                           f"再按坐标点下去只是浪费步数，已阻止 {primary.name}。\n"
+                           f"必须换一种打法，任选其一：\n"
+                           f"  1) 用键盘：press_key / hotkey（如 Tab 切焦点、Enter 确认、"
+                           f"Ctrl+F 搜索），比坐标可靠；\n"
+                           f"  2) 用程序的命令行/配置文件等确定性入口，绕开界面；\n"
+                           f"  3) 换目标窗口，或先 screenshot 看一眼真实布局再决定；\n"
+                           f"  4) 确实需要人看一眼时调用 ask_human 问清楚；\n"
+                           f"  5) 判断这任务做不了就调用 finish 说明卡在哪。"))
+                self._log("warn", f"🚫 已阻止 {primary.name}：连续 {blind} 步读不到界面元素")
+                yield self._emit("circuit_break", step=step, name=primary.name,
+                                 count=blind, reason="blind")
             else:
                 result = self.executor.run(primary.name, primary.arguments)
 
@@ -238,6 +306,8 @@ class Agent:
 
             if result.snapshot is not None:
                 snapshot = result.snapshot
+                # 界面读不出元素就累计"瞎点"步数；一旦读出元素立刻清零
+                self._blind_run = 0 if snapshot.elements else self._blind_run + 1
                 yield self._emit("observation", step=step, text=snapshot.render(),
                                  snapshot=snapshot.as_dict())
 
@@ -284,11 +354,16 @@ class Agent:
     def _ask_with_image(self, messages: list[dict[str, Any]],
                         tools: list[dict[str, Any]],
                         snapshot: Snapshot) -> LLMResponse:
-        """把截图作为图像内容附在最后一条消息上（需要视觉模型）。"""
+        """把截图作为图像内容附在最后一条 user 消息上。
+
+        注意用 **PNG** 而不是 JPEG：JPEG 的块效应会把小字号代码和公式糊掉，
+        而模型这边是按"最多 1024 token/图"计费的，压不压缩几乎不影响成本。
+        ``detail=original`` 保留原图，否则会被缩到 512x512 直接读不清。
+        """
         import base64
 
-        shot = snapshot.image.scaled(1280, 800)
-        data = base64.b64encode(shot.to_bytes("jpg", quality=72)).decode("ascii")
+        shot = snapshot.image.scaled(1600, 1000)
+        data = base64.b64encode(shot.to_bytes("png")).decode("ascii")
         msgs = [dict(m) for m in messages]
         for i in range(len(msgs) - 1, -1, -1):
             if msgs[i].get("role") == "user":
@@ -297,25 +372,47 @@ class Agent:
                     msgs[i]["content"] = [
                         {"type": "text", "text": original},
                         {"type": "image_url",
-                         "image_url": {"url": f"data:image/jpeg;base64,{data}"}},
+                         "image_url": {"url": f"data:image/png;base64,{data}",
+                                       "detail": "original"}},
                     ]
                 break
         return self.llm.chat(msgs, tools=tools, temperature=self.config.temperature)
 
     @staticmethod
     def _trim_history(messages: list[dict[str, Any]], keep_recent: int) -> list[dict[str, Any]]:
-        """把较早的工具结果压缩掉，控制上下文长度（保持消息结构合法）。"""
-        tool_indexes = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-        if len(tool_indexes) <= keep_recent:
+        """上下文超预算时，**从最前面整批丢掉最老的几轮对话**。
+
+        踩过的坑（实测）：早期版本会把"过期的工具结果"**原地改写成占位符**。
+        看着很合理——上下文确实变短了——但改的位置在对话靠前处，前缀缓存
+        从被改的那一条起整段失效。10 步模拟：
+
+            步 1~6   纯追加      命中率 85→90%，每步未命中 ~1714 token
+            步 7     开始改写    命中率掉到 53.9%，未命中 8322 token
+            步 8                单步耗时从 1.6s 涨到 7.6s
+
+        未命中 token 是要真花钱的，也是要真等的。所以现在：
+          · 只**整条丢弃**，绝不改写任何已有消息的内容；
+          · 攒到超预算才丢，而且一次丢够（丢到预算的 70%），
+            这样两次丢弃之间全是纯追加，前缀缓存全中。
+
+        ``keep_recent`` 现在的作用是"至少保留多少轮"，防止一次丢太狠。
+        """
+        if _history_chars(messages) <= CONTEXT_CHAR_BUDGET:
             return messages
-        stale = set(tool_indexes[:-keep_recent])
-        out = []
-        for i, msg in enumerate(messages):
-            if i in stale and len(str(msg.get("content") or "")) > 200:
-                out.append({**msg, "content": "（早期观察已省略，需要时重新 observe）"})
+
+        head, rest = messages[:2], messages[2:]      # 保住 system + 目标
+        rounds: list[list[dict[str, Any]]] = []
+        for msg in rest:
+            if msg.get("role") == "user" or not rounds:
+                rounds.append([msg])
             else:
-                out.append(msg)
-        return out
+                rounds[-1].append(msg)
+
+        floor = max(1, int(keep_recent))
+        target = int(CONTEXT_CHAR_BUDGET * CONTEXT_TRIM_TARGET)
+        while len(rounds) > floor and _history_chars(head + _flatten(rounds)) > target:
+            rounds.pop(0)
+        return head + _flatten(rounds)
 
     def _emit(self, kind: str, **payload: Any) -> dict[str, Any]:
         """广播一个事件，并返回它（便于 ``yield self._emit(...)``）。"""

@@ -228,7 +228,12 @@ class Executor:
         self.steps += 1
 
         # 6) 自动重新感知
+        # 动作可以声明 observe="none" 跳过这一步。一次全屏感知要跑 UIA 元素树
+        # （~0.45s）加系统 OCR（~0.75s），实测 1.28s；而对浏览器动作来说这些信息
+        # 基本没用——网页内容不在桌面元素树里，模型要的是页面本身。
+        # 实测 browser_eval 求一个 JS 表达式：带感知 455ms，不带 2ms。
         if (result.ok and action.mutates and self.auto_observe != "none"
+                and action.observe != "none"
                 and not isinstance(result.output, Snapshot)):
             try:
                 snap = self._observe()

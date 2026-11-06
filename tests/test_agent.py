@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from autopilot import perceive
+from autopilot import perceive, winapi
 from autopilot.agent import Agent, AgentConfig, AgentRun
 from autopilot.executor import ActionResult
 from autopilot.llm import LLMResponse, ToolCall
@@ -49,10 +49,10 @@ class FakeContext:
         self.events: list[dict] = []
         self.logs: list[tuple[str, str]] = []
 
-    def takemake_snapshotshot(self, **kwargs) -> Snapshot:
+    def take_snapshot(self, **kwargs) -> Snapshot:
         return self.snapshot
 
-    def setmake_snapshotshot(self, snap: Snapshot) -> Snapshot:
+    def set_snapshot(self, snap: Snapshot) -> Snapshot:
         self.snapshot = snap
         return snap
 
@@ -90,6 +90,8 @@ class FakeExecutor:
         self.registry = FakeRegistry()
         self.auto_observe = "none"
         self.calls: list[tuple[str, dict]] = []
+        # 每次 run 依次弹出一个快照，用完就一直复用最后一个（模拟"界面读不出元素"）
+        self.snapshots: list[Snapshot] = []
 
     def run(self, name: str, params: dict) -> ActionResult:
         self.calls.append((name, params))
@@ -101,6 +103,9 @@ class FakeExecutor:
             result.success = True
         else:
             result.output = f"{name} 执行完成"
+            if self.snapshots:
+                result.snapshot = (self.snapshots.pop(0) if len(self.snapshots) > 1
+                                   else self.snapshots[0])
         return result
 
 
@@ -263,17 +268,29 @@ def test_ask_human_stops_and_reports() -> None:
 
 
 def test_history_is_trimmed_but_keeps_recent() -> None:
-    messages = [{"role": "system", "content": "s"}]
-    for i in range(10):
+    """超预算时丢掉最老的几轮，最近的一定要留着。
+
+    注意这个测试以前断言的是"原地把老内容替换成占位符"——那正是把前缀缓存
+    打掉一半的原因（见文件末尾的裁剪/缓存测试）。现在改成了整轮丢弃。
+    """
+    from autopilot.agent import CONTEXT_CHAR_BUDGET
+
+    chunk = "观察内容" * 500                     # 2000 字符
+    rounds = CONTEXT_CHAR_BUDGET // len(chunk) + 10   # 保证真的超预算
+
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "目标"}]
+    for i in range(rounds):
+        messages.append({"role": "user", "content": f"[第 {i} 步]"})
         messages.append({"role": "assistant", "content": None,
                          "tool_calls": [{"id": f"t{i}"}]})
-        messages.append({"role": "tool", "tool_call_id": f"t{i}",
-                         "content": "观察内容" * 100})
+        messages.append({"role": "tool", "tool_call_id": f"t{i}", "content": chunk})
     trimmed = Agent._trim_history(messages, keep_recent=3)
-    assert len(trimmed) == len(messages), "消息数量不能变，否则 tool 配对会断"
+
+    assert len(trimmed) < len(messages), "超预算就该真的裁掉，而不是只改内容"
     tools = [m for m in trimmed if m["role"] == "tool"]
-    assert "省略" in tools[0]["content"]
-    assert "观察内容" in tools[-1]["content"]
+    assert len(tools) >= 3, "最近几轮必须留着"
+    assert tools[-1]["content"] == chunk, "最新的观察一个字都不能动"
+    assert tools[0]["content"] == chunk, "留下的观察也不许被改写"
 
 
 def test_usage_is_accumulated() -> None:
@@ -374,3 +391,225 @@ def test_threshold_is_reasonable() -> None:
     from autopilot.agent import MAX_IDENTICAL_REPEAT
 
     assert 2 <= MAX_IDENTICAL_REPEAT <= 5, "太小会误伤重试，太大挡不住死循环"
+
+
+# --------------------------------------------------------------------------
+# 步数提示
+#
+# 也是真实教训：原来写的是"剩余步数不多，请直接推进到目标**或调用 finish
+# 说明情况**"，结果模型在还剩 3 步时就主动认输（实测第 29/30 步就 finish）。
+# 催促必须是"抓紧推进"，不能给放弃的台阶。
+# --------------------------------------------------------------------------
+
+
+def test_step_hint_reports_progress() -> None:
+    from autopilot.prompts import build_step_hint
+
+    hint = build_step_hint(5, 50, 45)
+    assert "第 5/50 步" in hint
+    assert "还剩 45 步" in hint
+
+
+def test_step_hint_is_silent_until_the_end() -> None:
+    """预算充裕时不该催收尾，否则模型会提前放弃。"""
+    from autopilot.prompts import build_step_hint
+
+    for remaining in (45, 20, 10, 3):
+        assert "预算快用完" not in build_step_hint(1, 50, remaining)
+
+
+def test_step_hint_pushes_forward_near_the_end() -> None:
+    from autopilot.prompts import build_step_hint
+
+    hint = build_step_hint(49, 50, 1)
+    assert "预算快用完" in hint
+    assert "全部" in hint, "要明确让它把剩余步数用在推进目标上"
+    assert "只有确实做不完时才" in hint, "不能给'可以放弃了'的台阶"
+
+
+def test_step_hint_includes_last_error() -> None:
+    from autopilot.prompts import build_step_hint
+
+    hint = build_step_hint(7, 50, 43, last_error="点击超时")
+    assert "点击超时" in hint
+    assert "不要重复" in hint
+
+
+# --------------------------------------------------------------------------
+# 上下文裁剪 vs 前缀缓存
+#
+# 踩过的大坑：原来会把"过期的工具结果"**原地改写成占位符**。上下文是变短了，
+# 但改的位置在对话靠前处，前缀缓存从那里整段失效。10 步实测：
+#   纯追加阶段  命中率 85→90%，每步未命中 ~1714 token
+#   第 7 步开始改写   命中率掉到 53.9%，未命中 8322 token，单步 1.6s → 7.6s
+# 现在只整条丢弃，且攒够了一次丢到位。
+# --------------------------------------------------------------------------
+
+
+def _long_conversation(rounds: int, chars: int = 4000) -> list[dict]:
+    msgs = [{"role": "system", "content": "系统提示"},
+            {"role": "user", "content": "目标"}]
+    for i in range(rounds):
+        msgs.append({"role": "user", "content": f"[第 {i} 步]"})
+        msgs.append({"role": "assistant", "content": None,
+                     "tool_calls": [{"id": f"c{i}", "type": "function",
+                                     "function": {"name": "observe", "arguments": "{}"}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "观" * chars})
+    return msgs
+
+
+def test_history_is_not_rewritten_in_place() -> None:
+    """裁剪只能整条丢，绝不能改写已有消息——改写会毁掉前缀缓存。"""
+    from autopilot.agent import Agent
+
+    msgs = _long_conversation(30)
+    before = [m.get("content") for m in msgs]
+    out = Agent._trim_history(msgs, 5)
+
+    kept = {id(m) for m in out}
+    for msg, content in zip(msgs, before):
+        if id(msg) in kept:
+            assert msg.get("content") == content or msg.get("role") == "tool", \
+                "留在上下文里的消息内容被改写了"
+    # 长内容一个都不能被替换成占位符
+    for msg in out:
+        if msg.get("role") == "tool":
+            assert "已省略" not in str(msg.get("content")), "又出现了原地改写"
+
+
+def test_history_drops_a_whole_batch_not_one_at_a_time() -> None:
+    """攒够了一次丢到位，否则每步都丢一点 = 每步都破坏缓存。"""
+    from autopilot.agent import Agent, CONTEXT_CHAR_BUDGET
+
+    msgs = _long_conversation(40)
+    out = Agent._trim_history(msgs, 5)
+
+    dropped = len(msgs) - len(out)
+    assert dropped > 3, f"只丢了 {dropped} 条——应该一次丢够，留出后续纯追加的空间"
+    # 丢完应该明显低于预算，这样接下来好几步都不用再丢
+    from autopilot.agent import _history_chars
+
+    assert _history_chars(out) < CONTEXT_CHAR_BUDGET * 0.8
+
+
+def test_history_keeps_the_system_prompt_and_goal() -> None:
+    from autopilot.agent import Agent
+
+    msgs = _long_conversation(40)
+    out = Agent._trim_history(msgs, 5)
+    assert out[0] == msgs[0], "system 提示词永远不能丢"
+    assert out[1] == msgs[1], "任务目标永远不能丢"
+
+
+def test_short_conversation_is_left_alone() -> None:
+    """没超预算就别动——任何改动都是缓存失效。"""
+    from autopilot.agent import Agent
+
+    msgs = _long_conversation(3, chars=200)
+    assert Agent._trim_history(msgs, 5) is msgs
+
+
+def test_trim_keeps_message_structure_valid() -> None:
+    """丢掉几轮之后，第一条不能是 tool（tool 必须跟在它的 assistant 后面）。"""
+    from autopilot.agent import Agent
+
+    out = Agent._trim_history(_long_conversation(40), 5)
+    assert out[2].get("role") == "user", "裁剪后第一轮必须以 user 提示开头"
+    for i, msg in enumerate(out):
+        if msg.get("role") == "tool":
+            assert out[i - 1].get("role") in ("tool", "assistant"), \
+                "tool 消息的前一条必须是 assistant 或另一个 tool"
+
+
+def test_default_budget_is_generous_enough() -> None:
+    """默认预算要够做完一个多步 GUI 任务（原来 30 步实测不够）。"""
+    from autopilot.agent import AgentConfig
+
+    assert AgentConfig().max_steps >= 40
+
+
+# --------------------------------------------------------------------------
+# 盲点熔断
+#
+# 真实教训：让 Agent 去"打开UU加速器并加速 steam"，UU 是自绘界面——没有 UIA
+# 元素、OCR 读出来的也是乱码。模型看不到任何反馈，就一路按坐标瞎点，
+# 37 步全部 ok、零进展，步数全烧光。软提示没用，必须硬拦。
+# --------------------------------------------------------------------------
+
+
+def _blind_agent(steps: int = 12, max_steps: int = 20):
+    ctx = FakeContext(make_snapshot())          # make_snapshot() 的 elements 是空的
+    executor = FakeExecutor([])
+    executor.snapshots = [make_snapshot()]
+    llm = FakeLLM([_call("click", {"x": 100 + i, "y": 200 + i}) for i in range(steps)]
+                  + [_call("finish", {"summary": "放弃"})])
+    agent = _make_agent(llm, executor, ctx, max_steps=max_steps)
+    return agent, executor, ctx
+
+
+def test_blind_clicking_is_blocked() -> None:
+    from autopilot.agent import BLIND_BLOCK_STEPS
+
+    agent, executor, ctx = _blind_agent()
+    agent.run()
+
+    clicks = [c for c in executor.calls if c[0] == "click"]
+    assert len(clicks) < BLIND_BLOCK_STEPS + 3, \
+        f"瞎点必须被拦住，实际执行了 {len(clicks)} 次"
+    assert any(e["kind"] == "circuit_break" and e.get("reason") == "blind"
+               for e in ctx.events), "要发出瞎点熔断事件"
+
+
+def test_blind_block_tells_the_model_what_to_do_instead() -> None:
+    agent, _, _ = _blind_agent()
+    run = agent.run()
+    denied = [a for a in run.actions if a.get("denied") and "读不出" in str(a.get("reason", ""))]
+    assert denied, "被拦下来的动作要有记录"
+    err = str(denied[0].get("error", ""))
+    for kw in ("键盘", "ask_human", "finish", "screenshot"):
+        assert kw in err, f"拦下来还得给出路，缺少 {kw}"
+
+
+def test_blind_counter_resets_when_elements_come_back() -> None:
+    """一旦读出元素，就不该再算"瞎点"。"""
+    from autopilot.agent import BLIND_BLOCK_STEPS
+
+    empty = make_snapshot()
+    good = Snapshot(ts=time.time(), screen_size=(1920, 1200), cursor=(0, 0), scale=1.0,
+                    foreground=None, window_list=[],
+                    elements=[perceive.Element(index=1, name="开始加速", control_type="Button",
+                                               class_name="Button", rect=winapi.Rect(10, 10, 80, 30))])
+    ctx = FakeContext(empty)
+    executor = FakeExecutor([])
+    # 前 6 步读不到元素，第 7 步界面出来了——第 7 步的 blind 计数是 7，还没到 8
+    executor.snapshots = [empty] * (BLIND_BLOCK_STEPS - 2) + [good]
+    llm = FakeLLM(
+        [_call("click", {"x": i, "y": i}) for i in range(BLIND_BLOCK_STEPS - 1)]
+        + [_call("click", {"x": 9, "y": 9}) for _ in range(3)]
+        + [_call("finish", {"summary": "ok"})])
+    agent = _make_agent(llm, executor, ctx, max_steps=20)
+    agent.run()
+    assert not any(e["kind"] == "circuit_break" for e in ctx.events), \
+        "读出元素后不该再熔断"
+    assert [c[0] for c in executor.calls].count("click") == BLIND_BLOCK_STEPS + 2, \
+        "计数清零后应该恢复正常点击"
+
+
+def test_blind_step_hint_warns_but_does_not_give_up() -> None:
+    from autopilot.prompts import build_step_hint
+
+    hint = build_step_hint(9, 50, 41, blind_steps=5)
+    assert "读不到任何界面元素" in hint
+    assert "键盘" in hint and "ask_human" in hint
+    assert "预算快用完" not in hint, "还早，不能泄气"
+    assert build_step_hint(9, 50, 41, blind_steps=0).count("读不到") == 0
+
+
+def test_prompt_has_one_step_guidance() -> None:
+    """提示词必须明确"一件事一步做完"，否则模型还是会分步探索。"""
+    from autopilot.prompts import SYSTEM_PROMPT
+
+    assert "一步到位" in SYSTEM_PROMPT
+    for kw in ("app_status", "wait_title", "find_app", "wmic"):
+        assert kw in SYSTEM_PROMPT, f"提示词里缺少 {kw} 的指引"
+    assert "递归扫盘" in SYSTEM_PROMPT
